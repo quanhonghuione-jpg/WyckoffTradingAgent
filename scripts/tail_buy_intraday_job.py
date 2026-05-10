@@ -213,7 +213,7 @@ def _safe_bool(raw: Any) -> bool:
 
 def _resolve_quote_price(quote: dict[str, Any] | None) -> float:
     row = quote or {}
-    for key in ("close", "last", "price", "current", "open"):
+    for key in ("last_price", "close", "last", "price", "current"):
         value = _safe_float(row.get(key), 0.0)
         if value > 0:
             return value

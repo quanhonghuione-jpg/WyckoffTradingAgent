@@ -18,6 +18,7 @@ jobs:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      TICKFLOW_API_KEY: ${{ secrets.TICKFLOW_API_KEY }}
       TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
       TZ: Asia/Shanghai
 
@@ -51,4 +52,3 @@ jobs:
           path: logs/recommendation_reprice*.log
           retention-days: 7
           if-no-files-found: warn
-

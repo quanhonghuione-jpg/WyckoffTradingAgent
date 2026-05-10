@@ -14,10 +14,6 @@ import re
 from datetime import UTC, datetime
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
-from supabase import Client
-
 from core.constants import (
     TABLE_DAILY_NAV,
     TABLE_PORTFOLIO_POSITIONS,
@@ -27,6 +23,9 @@ from core.constants import (
 )
 from integrations.supabase_base import create_admin_client as _get_supabase_admin_client
 from integrations.supabase_base import is_admin_configured as is_supabase_configured
+from supabase import Client
+
+logger = logging.getLogger(__name__)
 
 
 def load_user_settings_admin(user_id: str) -> dict[str, Any] | None:
