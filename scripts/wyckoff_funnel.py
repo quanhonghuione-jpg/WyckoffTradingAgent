@@ -125,10 +125,10 @@ except Exception:
     logger.debug("FUNNEL_L2_BYPASS_AI_CAP parse failed, using default", exc_info=True)
     FUNNEL_L2_BYPASS_AI_CAP = 30
 try:
-    FUNNEL_ETF_DISPLAY_LIMIT = max(int(float(os.getenv("FUNNEL_ETF_DISPLAY_LIMIT", "8"))), 0)
+    FUNNEL_ETF_DISPLAY_LIMIT = max(int(float(os.getenv("FUNNEL_ETF_DISPLAY_LIMIT", "0"))), 0)
 except Exception:
     logger.debug("FUNNEL_ETF_DISPLAY_LIMIT parse failed, using default", exc_info=True)
-    FUNNEL_ETF_DISPLAY_LIMIT = 8
+    FUNNEL_ETF_DISPLAY_LIMIT = 0
 
 
 def _resolve_funnel_end_calendar_day() -> date:
