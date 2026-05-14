@@ -52,6 +52,7 @@ from tools.candidate_ranker import (
     TRIGGER_GROUP_TITLES,
     TRIGGER_LABELS,
     TRIGGER_SHORT_LABELS,
+    calc_close_return_pct,
 )
 from tools.candidate_ranker import (
     rank_l3_candidates as _rank_l3_candidates,
@@ -108,6 +109,10 @@ try:
     FUNNEL_BYPASS_DISPLAY_LIMIT = max(int(float(os.getenv("FUNNEL_BYPASS_DISPLAY_LIMIT", "20"))), 0)
 except Exception:
     FUNNEL_BYPASS_DISPLAY_LIMIT = 20
+try:
+    FUNNEL_ETF_DISPLAY_LIMIT = max(int(float(os.getenv("FUNNEL_ETF_DISPLAY_LIMIT", "8"))), 0)
+except Exception:
+    FUNNEL_ETF_DISPLAY_LIMIT = 8
 
 
 def _resolve_funnel_end_calendar_day() -> date:
@@ -330,6 +335,73 @@ def _build_etf_funnel_config(base_cfg: FunnelConfig) -> FunnelConfig:
     return cfg
 
 
+def _etf_display_name(code: str, sector_map: dict[str, str]) -> str:
+    tag = str(sector_map.get(code, "") or "").strip()
+    if not tag:
+        return code
+    if tag.upper().endswith("ETF") or tag.endswith("基金"):
+        return tag
+    return f"{tag}ETF"
+
+
+def _latest_volume_ratio(df: pd.DataFrame) -> float | None:
+    if df is None or df.empty or "volume" not in df.columns:
+        return None
+    volume = pd.to_numeric(df["volume"], errors="coerce")
+    vol_ma20 = volume.rolling(20, min_periods=5).mean()
+    latest = volume.dropna()
+    ma_latest = vol_ma20.dropna()
+    if latest.empty or ma_latest.empty:
+        return None
+    base = float(ma_latest.iloc[-1])
+    if base <= 0:
+        return None
+    return float(latest.iloc[-1]) / base
+
+
+def _rank_etf_candidates(
+    l2_passed: list[str],
+    df_map: dict[str, pd.DataFrame],
+    sector_map: dict[str, str],
+    channel_map: dict[str, str],
+) -> list[dict]:
+    rows: list[dict] = []
+    for code in l2_passed:
+        df = df_map.get(code)
+        if df is None or df.empty or "close" not in df.columns:
+            continue
+        s = df.sort_values("date") if "date" in df.columns else df
+        close = pd.to_numeric(s["close"], errors="coerce")
+        ret3 = calc_close_return_pct(close, 3)
+        ret5 = calc_close_return_pct(close, 5)
+        ret20 = calc_close_return_pct(close, 20)
+        vol_ratio = _latest_volume_ratio(s)
+        channel = str(channel_map.get(code, "") or "").strip()
+        channel_bonus = 3.0 if "主升" in channel or "点火" in channel else 0.0
+        score = (
+            max(ret20 or 0.0, -10.0) * 0.35
+            + max(ret5 or 0.0, -5.0) * 0.75
+            + max(ret3 or 0.0, -3.0) * 1.1
+            + min(max(vol_ratio or 1.0, 0.0), 3.0) * 2.0
+            + channel_bonus
+        )
+        rows.append(
+            {
+                "code": code,
+                "name": _etf_display_name(code, sector_map),
+                "sector": str(sector_map.get(code, "") or ""),
+                "channel": channel,
+                "ret3": ret3,
+                "ret5": ret5,
+                "ret20": ret20,
+                "vol_ratio": vol_ratio,
+                "score": score,
+            }
+        )
+    rows.sort(key=lambda row: float(row.get("score", 0.0) or 0.0), reverse=True)
+    return rows
+
+
 def _load_benchmark_indices(start_s: str, end_s: str):
     """加载大盘和小盘基准指数，失败时优雅降级。"""
     bench_df = smallcap_df = None
@@ -352,16 +424,17 @@ def _run_etf_enhancement(
     bench_df: pd.DataFrame | None,
     sector_map: dict[str, str],
     all_df_map: dict[str, pd.DataFrame],
-) -> tuple[list[str], dict[str, str], dict[str, pd.DataFrame], list[str]]:
+) -> tuple[list[str], dict[str, str], dict[str, pd.DataFrame], list[str], list[dict]]:
     """加载 ETF 并跑 L1/L2，过 L2 的 ETF 注入 sector_map 和 all_df_map。"""
     etf_symbols, etf_sector_map = _load_etf_universe()
     etf_df_map = _fetch_etf_ohlcv(etf_symbols, window)
     etf_l2_passed: list[str] = []
+    etf_candidates: list[dict] = []
     if etf_df_map:
         etf_cfg = _build_etf_funnel_config(base_cfg)
         etf_l1 = layer1_filter(list(etf_df_map.keys()), {}, {}, etf_df_map, etf_cfg)
         if etf_l1:
-            etf_l2, _, _ = layer2_strength_detailed(
+            etf_l2, etf_channel_map, _ = layer2_strength_detailed(
                 etf_l1,
                 etf_df_map,
                 bench_df,
@@ -369,21 +442,66 @@ def _run_etf_enhancement(
                 rps_universe=etf_l1,
             )
             etf_l2_passed = etf_l2
+            etf_candidates = _rank_etf_candidates(etf_l2_passed, etf_df_map, etf_sector_map, etf_channel_map)
             sector_map.update(etf_sector_map)
             all_df_map.update(etf_df_map)
         print(f"[funnel] ETF板块增强: fetched={len(etf_df_map)}, L1={len(etf_l1)}, L2={len(etf_l2_passed)}")
     else:
         print("[funnel] ETF板块增强: 跳过")
-    return etf_symbols, etf_sector_map, etf_df_map, etf_l2_passed
+    return etf_symbols, etf_sector_map, etf_df_map, etf_l2_passed, etf_candidates
 
 
-def _etf_metrics(syms, df_map, l2_passed, sector_map) -> dict:
+def _etf_metrics(syms, df_map, l2_passed, sector_map, candidates=None) -> dict:
     return {
         "pool": len(syms),
         "fetched": len(df_map),
         "l2_passed": len(l2_passed),
+        "strong_candidates": len(candidates or []),
         "boosted_sectors": sorted(set(sector_map.get(s, "") for s in l2_passed) - {""}),
     }
+
+
+def _fmt_pct(value) -> str:
+    try:
+        return f"{float(value):+.1f}%"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _fmt_ratio(value) -> str:
+    try:
+        return f"{float(value):.2f}x"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _append_etf_section(lines: list[str], etf_metrics: dict, etf_candidates: list[dict]) -> None:
+    if not etf_metrics and not etf_candidates:
+        return
+    pool = int(etf_metrics.get("pool", 0) or 0)
+    fetched = int(etf_metrics.get("fetched", 0) or 0)
+    l2_passed = int(etf_metrics.get("l2_passed", 0) or 0)
+    lines.append(f"**ETF强势池**: 池{pool} → 拉取{fetched} → L2强势{l2_passed}")
+    if not etf_candidates:
+        return
+
+    display = etf_candidates if FUNNEL_ETF_DISPLAY_LIMIT <= 0 else etf_candidates[:FUNNEL_ETF_DISPLAY_LIMIT]
+    lines.append(f"**【📈 强势ETF】{len(etf_candidates)} 只**")
+    for row in display:
+        channel = str(row.get("channel", "") or "").replace("通道", "")
+        parts = [
+            f"3日{_fmt_pct(row.get('ret3'))}",
+            f"20日{_fmt_pct(row.get('ret20'))}",
+            f"量{_fmt_ratio(row.get('vol_ratio'))}",
+        ]
+        if channel:
+            parts.append(channel)
+        lines.append(
+            f"  {row.get('code')} {row.get('name')}  {float(row.get('score', 0.0) or 0.0):.2f}  {' | '.join(parts)}"
+        )
+    omitted = len(etf_candidates) - len(display)
+    if omitted > 0:
+        lines.append(f"  ... 另 {omitted} 只略")
 
 
 def run_funnel_job(
@@ -478,7 +596,7 @@ def run_funnel_job(
         smallcap_df=smallcap_df,
     )
 
-    etf_symbols, etf_sector_map, etf_df_map, etf_l2_passed = _run_etf_enhancement(
+    etf_symbols, etf_sector_map, etf_df_map, etf_l2_passed, etf_candidates = _run_etf_enhancement(
         cfg, window, bench_df, sector_map, all_df_map
     )
 
@@ -613,7 +731,8 @@ def run_funnel_job(
         "layer2_channel_map": l2_channel_map,
         "layer3": len(l3_passed),
         "top_sectors": top_sectors,
-        "etf_enhancement": _etf_metrics(etf_symbols, etf_df_map, etf_l2_passed, etf_sector_map),
+        "etf_enhancement": _etf_metrics(etf_symbols, etf_df_map, etf_l2_passed, etf_sector_map, etf_candidates),
+        "etf_candidates": etf_candidates,
         "sector_rotation": sector_rotation,
         "layer3_symbols": ranked_l3_symbols or l3_passed,
         "layer3_score_map": l3_score_map,
@@ -728,6 +847,8 @@ def run(
     bypass_triggers = metrics.get("l2_bypass_triggers", {}) or {}
     sector_rotation = metrics.get("sector_rotation", {}) or {}
     sector_rotation_map = sector_rotation.get("state_map", {}) or {}
+    etf_metrics = metrics.get("etf_enhancement", {}) or {}
+    etf_candidates = metrics.get("etf_candidates", []) or []
     # 策略：大盘水温驱动的双轨制（Top-Down 择时顺势策略）
     regime = benchmark_context.get("regime", "NEUTRAL")
     if use_legacy_selection:
@@ -812,6 +933,9 @@ def run(
             f"**Top 行业**: {', '.join(metrics['top_sectors']) if metrics['top_sectors'] else '无'}",
             "",
         ]
+        _append_etf_section(lines, etf_metrics, etf_candidates)
+        if etf_metrics or etf_candidates:
+            lines.append("")
 
         # ── 命中列表：按信号分组 ──
         def _score_star(s: float) -> str:
@@ -1008,6 +1132,9 @@ def run(
         f"**Top 行业**: {', '.join(metrics['top_sectors']) if metrics['top_sectors'] else '无'}",
         "",
     ]
+    _append_etf_section(lines, etf_metrics, etf_candidates)
+    if etf_metrics or etf_candidates:
+        lines.append("")
 
     def _score_star(s: float) -> str:
         if s >= 10:

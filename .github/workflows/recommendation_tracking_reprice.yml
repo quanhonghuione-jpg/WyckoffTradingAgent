@@ -1,9 +1,6 @@
 name: Wyckoff Pattern Replay Reprice
 
 on:
-  schedule:
-    # 北京时间 23:00（UTC+8）= UTC 同日 15:00；周日到周四执行
-    - cron: "0 15 * * 0-4"
   workflow_dispatch:
 
 concurrency:
