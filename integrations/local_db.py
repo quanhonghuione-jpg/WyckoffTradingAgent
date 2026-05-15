@@ -904,8 +904,8 @@ def load_chat_logs(*, session_id: str | None = None, limit: int = 200) -> list[d
     conn = get_db()
     if session_id:
         cur = conn.execute(
-            "SELECT * FROM chat_log WHERE session_id=? ORDER BY created_at ASC",
-            (session_id,),
+            "SELECT * FROM chat_log WHERE session_id=? ORDER BY created_at ASC LIMIT ?",
+            (session_id, limit),
         )
     else:
         cur = conn.execute(

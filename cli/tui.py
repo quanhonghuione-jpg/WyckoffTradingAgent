@@ -517,22 +517,33 @@ class WyckoffTUI(App):
 
     # ----- 快捷键动作 -----
 
+    def _save_memory_async(
+        self, messages: list[dict] | None = None, *, wait_timeout: float | None = None, skip_layers: bool = False
+    ) -> None:
+        if not self._provider:
+            return
+        msgs = list(messages if messages is not None else self._messages)
+        if not msgs:
+            return
+        try:
+            import threading
+
+            from cli.memory import save_session_summary
+
+            t = threading.Thread(
+                target=save_session_summary,
+                args=(msgs, self._provider),
+                kwargs={"session_id": self._session_id, "skip_layers": skip_layers},
+                daemon=True,
+            )
+            t.start()
+            if wait_timeout is not None:
+                t.join(timeout=wait_timeout)
+        except Exception:
+            logger.debug("save session summary failed", exc_info=True)
+
     def _save_and_exit(self) -> None:
-        if self._messages and self._provider:
-            try:
-                import threading
-
-                from cli.memory import save_session_summary
-
-                t = threading.Thread(
-                    target=save_session_summary,
-                    args=(list(self._messages), self._provider),
-                    daemon=True,
-                )
-                t.start()
-                t.join(timeout=5)
-            except Exception:
-                logger.debug("save session summary on exit failed", exc_info=True)
+        self._save_memory_async(wait_timeout=5, skip_layers=True)
         self.exit()
 
     def action_quit(self) -> None:
@@ -1781,19 +1792,7 @@ class WyckoffTUI(App):
             return
 
         # 保存当前会话记忆
-        if self._messages and self._provider:
-            try:
-                import threading
-
-                from cli.memory import save_session_summary
-
-                threading.Thread(
-                    target=save_session_summary,
-                    args=(list(self._messages), self._provider),
-                    daemon=True,
-                ).start()
-            except Exception:
-                logger.debug("save session summary before restore failed", exc_info=True)
+        self._save_memory_async()
 
         self._messages.clear()
         self._queue.clear()
@@ -1838,20 +1837,7 @@ class WyckoffTUI(App):
 
     def action_new_chat(self) -> None:
         # 保存会话记忆
-        if self._messages and self._provider:
-            try:
-                import threading
-
-                from cli.memory import save_session_summary
-
-                msgs_copy = list(self._messages)
-                threading.Thread(
-                    target=save_session_summary,
-                    args=(msgs_copy, self._provider),
-                    daemon=True,
-                ).start()
-            except Exception:
-                logger.debug("save session summary before new chat failed", exc_info=True)
+        self._save_memory_async()
         self._messages.clear()
         self._queue.clear()
         self._session_tokens = {"input": 0, "output": 0, "rounds": 0}

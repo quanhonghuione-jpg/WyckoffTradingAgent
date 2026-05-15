@@ -107,7 +107,7 @@
   "scripts/backtest_runner.py::main": 319,
   "scripts/backtest_snapshot_fetch.py::main": 139,
   "scripts/build_demo_media.py::main": 75,
-  "scripts/daily_job.py::_run_step4_pipeline": 73,
+  "scripts/daily_job.py::_run_step4_pipeline": 74,
   "scripts/daily_job.py::main": 251,
   "scripts/db_maintenance.py::cleanup_unadjusted_cache": 54,
   "scripts/diagnose_holdings.py::main": 141,

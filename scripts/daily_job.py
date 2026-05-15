@@ -281,6 +281,7 @@ def _run_step4_pipeline(
     model: str,
     logs_path: str | None,
 ) -> dict:
+    from core.strategy import run_step4
     from scripts.step4_rebalancer import STEP4_REASON_MAP
 
     t0 = datetime.now(TZ)
@@ -408,7 +409,6 @@ def main() -> int:
         run_step3,
     )
     from core.funnel_pipeline import run_funnel as run_step2
-    from core.strategy import run_step4
 
     summary: list[dict] = []
     has_blocking_failure = False
