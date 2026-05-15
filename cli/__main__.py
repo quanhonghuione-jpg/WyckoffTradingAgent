@@ -574,6 +574,27 @@ def _cmd_screen(args):
     init_db()
     board = args.board or "all"
     print(f"正在执行全市场漏斗筛选 (board={board}) ...")
+    from integrations.strategy_api_client import (
+        StrategyApiError,
+        is_strategy_api_enabled,
+        is_strategy_api_required,
+        screen_stocks_legacy,
+    )
+
+    if is_strategy_api_enabled():
+        try:
+            result = screen_stocks_legacy(board="all" if board == "main_chinext" else board)
+            rows = result.get("symbols_for_report", []) or []
+            print(f"\n✓ 筛选完成  命中 {len(rows)} 只  source=strategy_api")
+            for item in rows[:20]:
+                print(f"    {item.get('code')}  {item.get('name', '')}  score={float(item.get('score') or 0):.2f}")
+            return
+        except StrategyApiError as e:
+            if is_strategy_api_required():
+                print(f"✗ 筛选失败: {e}")
+                sys.exit(1)
+            logger.warning("strategy api screen failed; falling back to local engine", exc_info=True)
+
     from scripts.wyckoff_funnel import run_funnel_job
 
     try:
@@ -607,6 +628,39 @@ def _cmd_backtest(args):
     end_dt = date.today() - timedelta(days=1)
     start_dt = end_dt - timedelta(days=args.months * 30)
     print(f"正在回测 {start_dt} → {end_dt}  hold_days={args.hold_days} ...")
+    from integrations.strategy_api_client import (
+        StrategyApiError,
+        is_strategy_api_enabled,
+        is_strategy_api_required,
+        run_backtest_legacy,
+    )
+
+    if is_strategy_api_enabled():
+        try:
+            summary = run_backtest_legacy(
+                start=start_dt.isoformat(),
+                end=end_dt.isoformat(),
+                hold_days=args.hold_days,
+                top_n=args.top_n,
+                board="all",
+                stop_loss_pct=-7.0,
+                take_profit_pct=18.0,
+            )
+            print(f"\n✓ 回测完成  交易 {summary.get('trades', 0)} 笔  source=strategy_api")
+            for k, v in summary.items():
+                if k in {"rows", "source", "task_id", "strategy_version"}:
+                    continue
+                if isinstance(v, float):
+                    print(f"  {k}: {v:.4f}")
+                else:
+                    print(f"  {k}: {v}")
+            return
+        except StrategyApiError as e:
+            if is_strategy_api_required():
+                print(f"✗ 回测失败: {e}")
+                sys.exit(1)
+            logger.warning("strategy api backtest failed; falling back to local engine", exc_info=True)
+
     from scripts.backtest_runner import run_backtest
 
     try:

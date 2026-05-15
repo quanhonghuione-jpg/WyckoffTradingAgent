@@ -81,6 +81,55 @@ def _apply_funnel_env(payload: dict[str, Any]) -> None:
 
 def _run_funnel_screen(request_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     _apply_funnel_env(payload)
+    from integrations.strategy_api_client import (
+        StrategyApiError,
+        is_strategy_api_enabled,
+        is_strategy_api_required,
+        screen_stocks_legacy,
+    )
+
+    if is_strategy_api_enabled():
+        try:
+            board = str(payload.get("board", "") or "all").strip().lower()
+            if board == "main_chinext":
+                board = "all"
+            manual_symbols = str(payload.get("manual_symbols", "") or "").strip()
+            universe = [code.strip() for code in manual_symbols.split(",") if code.strip()] if manual_symbols else None
+            top_n = int(payload.get("top_n") or payload.get("limit_count") or 20)
+            remote = screen_stocks_legacy(board=board, universe=universe, top_n=top_n)
+            symbols_for_report = remote.get("symbols_for_report", []) or []
+            return {
+                "request_id": request_id,
+                "job_kind": "funnel_screen",
+                "ok": True,
+                "source": "strategy_api",
+                "benchmark_context": {},
+                "metrics": {
+                    "total_symbols": int((remote.get("summary") or {}).get("total_scanned", 0) or 0),
+                    "strategy_version": remote.get("strategy_version"),
+                    "trade_date": remote.get("trade_date"),
+                },
+                "summary": {
+                    "total_symbols": int((remote.get("summary") or {}).get("total_scanned", 0) or 0),
+                    "layer1": int((remote.get("summary") or {}).get("layer1_passed", 0) or 0),
+                    "layer2": int((remote.get("summary") or {}).get("layer2_passed", 0) or 0),
+                    "layer3": int((remote.get("summary") or {}).get("layer3_passed", 0) or 0),
+                    "l4_unique_hits": len(symbols_for_report),
+                    "selected_for_ai": len(symbols_for_report),
+                },
+                "trigger_groups": remote.get("trigger_groups", {}),
+                "symbols_for_report": symbols_for_report,
+                "selected_for_ai": symbols_for_report,
+                "trend_selected": [],
+                "accum_selected": [],
+                "top_sectors": [],
+                "content_preview": json.dumps(symbols_for_report[:20], ensure_ascii=False),
+            }
+        except StrategyApiError:
+            if is_strategy_api_required():
+                raise
+            logger.warning("strategy api funnel failed; falling back to local engine", exc_info=True)
+
     from core.funnel_pipeline import run_funnel
 
     ok, symbols_for_report, benchmark_context, details = run_funnel(

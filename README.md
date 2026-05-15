@@ -218,7 +218,7 @@ wyckoff dashboard
 |--------|----------|
 | 架构、Actions、数据表、缓存 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | 运营成本、规模化预算 | [docs/COST_MODEL.md](docs/COST_MODEL.md) |
-| 漏斗、AI 研报、OMS、回测 | [README_STRATEGY.md](README_STRATEGY.md) |
+| 策略能力边界与私有 API 接入 | [README_STRATEGY.md](README_STRATEGY.md) |
 | 术语速查 | [GLOSSARY.md](GLOSSARY.md) |
 | MCP Server 配置 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#mcp-server) |
 | 密钥与本地配置安全 | [docs/SECRET_MANAGEMENT.md](docs/SECRET_MANAGEMENT.md) |
@@ -230,6 +230,14 @@ wyckoff dashboard
 ## 配置
 
 **零配置即可使用** — 启动后 `/model` 添加 LLM API Key 即可对话。
+
+如需把量化策略实现放到私有服务，配置：
+
+```bash
+WYCKOFF_STRATEGY_API_MODE=remote
+WYCKOFF_STRATEGY_API_URL=https://your-strategy-api.example.com
+WYCKOFF_STRATEGY_API_KEY=your-api-key
+```
 
 进阶配置见 [架构文档](docs/ARCHITECTURE.md)。
 

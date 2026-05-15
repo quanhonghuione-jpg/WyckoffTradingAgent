@@ -673,12 +673,33 @@ def analyze_stock(
         诊断结果或行情数据 dict。
     """
     try:
-        _ensure_tushare_token(tool_context)
-        from integrations.stock_hist_repository import _COL_MAP, get_stock_hist
-
         mode = (mode or "diagnose").strip().lower()
         if mode not in ("diagnose", "price"):
             return {"error": f"mode 参数无效: '{mode}'，可选值: diagnose, price"}
+
+        if mode == "diagnose":
+            from integrations.strategy_api_client import (
+                StrategyApiError,
+                analyze_stock_legacy,
+                is_strategy_api_enabled,
+                is_strategy_api_required,
+            )
+
+            if is_strategy_api_enabled():
+                try:
+                    return analyze_stock_legacy(
+                        code,
+                        cost=cost,
+                        user_id=_get_user_id(tool_context),
+                    )
+                except StrategyApiError as exc:
+                    if is_strategy_api_required():
+                        return {"error": str(exc), "source": "strategy_api"}
+                    logger.warning("strategy api diagnose failed; falling back to local engine", exc_info=True)
+
+        _ensure_tushare_token(tool_context)
+        from integrations.stock_hist_repository import _COL_MAP, get_stock_hist
+
         end_date = date.today()
 
         if mode == "price":
@@ -846,10 +867,6 @@ def portfolio(mode: str = "view", tool_context: ToolContext = None) -> dict:
             }
 
         # mode == "diagnose"
-        _ensure_tushare_token(tool_context)
-        from core.holding_diagnostic import diagnose_one_stock, format_diagnostic_text
-        from integrations.stock_hist_repository import get_stock_hist
-
         if not state.get("positions"):
             return {
                 "message": "持仓记录存在但无头寸",
@@ -857,6 +874,54 @@ def portfolio(mode: str = "view", tool_context: ToolContext = None) -> dict:
                 "free_cash": state.get("free_cash", 0),
                 "positions": [],
             }
+
+        from integrations.strategy_api_client import (
+            StrategyApiError,
+            analyze_stock_legacy,
+            is_strategy_api_enabled,
+            is_strategy_api_required,
+        )
+
+        if is_strategy_api_enabled():
+            results = []
+            successful_count = 0
+            failed_count = 0
+            api_failed = False
+            for pos in state["positions"]:
+                pos_code = pos.get("code", "") or pos.get("code", "")
+                pos_name = pos.get("name", pos_code)
+                pos_cost = float(pos.get("cost", pos.get("cost_price", 0)) or 0)
+                try:
+                    results.append(
+                        analyze_stock_legacy(
+                            pos_code,
+                            name=pos_name,
+                            cost=pos_cost,
+                            user_id=_get_user_id(tool_context),
+                        )
+                    )
+                    successful_count += 1
+                except StrategyApiError as exc:
+                    if not is_strategy_api_required():
+                        api_failed = True
+                        logger.warning("strategy api portfolio diagnose failed; falling back to local engine", exc_info=True)
+                        break
+                    failed_count += 1
+                    results.append({"code": pos_code, "name": pos_name, "error": str(exc), "source": "strategy_api"})
+            if not api_failed:
+                return {
+                    "source": "strategy_api",
+                    "portfolio_id": portfolio_id,
+                    "free_cash": state.get("free_cash", 0),
+                    "position_count": len(state["positions"]),
+                    "successful_count": successful_count,
+                    "failed_count": failed_count,
+                    "diagnostics": results,
+                }
+
+        _ensure_tushare_token(tool_context)
+        from core.holding_diagnostic import diagnose_one_stock, format_diagnostic_text
+        from integrations.stock_hist_repository import get_stock_hist
 
         end_date = date.today()
         start_date = end_date - timedelta(days=500)
@@ -1236,12 +1301,28 @@ def screen_stocks(board: str = "all", tool_context: ToolContext = None) -> dict:
         筛选结果 dict，包含各层统计和最终候选股票列表。
     """
     try:
-        _ensure_tushare_token(tool_context)
         # 参数校验与别名映射
         board = str(board or "all").strip().lower()
         board = _BOARD_ALIAS.get(board, board)
         if board not in _VALID_BOARDS:
             return {"error": f"不支持的 board 值 '{board}'，可选: all / main / chinext"}
+
+        from integrations.strategy_api_client import (
+            StrategyApiError,
+            is_strategy_api_enabled,
+            is_strategy_api_required,
+            screen_stocks_legacy,
+        )
+
+        if is_strategy_api_enabled():
+            try:
+                return screen_stocks_legacy(board=board)
+            except StrategyApiError as exc:
+                if is_strategy_api_required():
+                    return {"error": str(exc), "source": "strategy_api"}
+                logger.warning("strategy api screen failed; falling back to local engine", exc_info=True)
+
+        _ensure_tushare_token(tool_context)
 
         # 保存并设置环境变量（调用后恢复）
         prev_mode = os.environ.get("FUNNEL_POOL_MODE")
@@ -1982,10 +2063,6 @@ def run_backtest(
     try:
         from datetime import date, timedelta
 
-        from core.backtester import run_backtest as _run_backtest
-
-        _ensure_tushare_token(tool_context)
-
         start_dt = date.fromisoformat(str(start).strip()[:10]) if start else date.today() - timedelta(days=180)
         end_dt = date.fromisoformat(str(end).strip()[:10]) if end else date.today() - timedelta(days=1)
 
@@ -1993,6 +2070,33 @@ def run_backtest(
         top_n = max(0, min(int(top_n), 20))
         stop_loss_pct = min(0.0, float(stop_loss_pct))
         take_profit_pct = max(0.0, float(take_profit_pct))
+
+        from integrations.strategy_api_client import (
+            StrategyApiError,
+            is_strategy_api_enabled,
+            is_strategy_api_required,
+            run_backtest_legacy,
+        )
+
+        if is_strategy_api_enabled():
+            try:
+                return run_backtest_legacy(
+                    start=start_dt.isoformat(),
+                    end=end_dt.isoformat(),
+                    hold_days=hold_days,
+                    top_n=top_n,
+                    board=str(board or "main_chinext").strip(),
+                    stop_loss_pct=stop_loss_pct,
+                    take_profit_pct=take_profit_pct,
+                )
+            except StrategyApiError as exc:
+                if is_strategy_api_required():
+                    return {"error": str(exc), "source": "strategy_api"}
+                logger.warning("strategy api backtest failed; falling back to local engine", exc_info=True)
+
+        from core.backtester import run_backtest as _run_backtest
+
+        _ensure_tushare_token(tool_context)
 
         _trades_df, summary = _run_backtest(
             start_dt=start_dt,
