@@ -626,6 +626,10 @@ def summarize_decision_counts(candidates: list[TailBuyCandidate]) -> dict[str, i
     return out
 
 
+def _clean_extra_sections(extra_sections: list[str] | None) -> list[str]:
+    return [text for section in extra_sections or [] if (text := str(section or "").strip())]
+
+
 def build_tail_buy_markdown(
     *,
     now_text: str,
@@ -685,8 +689,9 @@ def build_tail_buy_markdown(
                 model_used = f"@{item.llm_model_used}" if item.llm_model_used else ""
                 llm_tag = f" | LLM:{item.llm_decision}{model_used}"
             llm_reason = f" | {item.llm_reason}" if item.llm_reason else ""
+            add_tag = "[加仓] " if item.signal_type == "holding" else ""
             lines.append(
-                f"- {item.code} {item.name} | priority={item.priority_score:.1f} | "
+                f"- {add_tag}{item.code} {item.name} | priority={item.priority_score:.1f} | "
                 f"rule={item.rule_decision}({item.rule_score:.1f}){llm_tag}"
                 f" | {reasons}{llm_reason}"
             )
@@ -695,12 +700,7 @@ def build_tail_buy_markdown(
             lines.append(f"- ... 其余 {omitted_errors} 只报错标的已省略（详见日志 artifacts）")
         lines.append("")
 
-    cleaned_sections: list[str] = []
-    for section in extra_sections or []:
-        text = str(section or "").strip()
-        if not text:
-            continue
-        cleaned_sections.append(text)
+    cleaned_sections = _clean_extra_sections(extra_sections)
 
     if extra_sections_first:
         for text in cleaned_sections:
