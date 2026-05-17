@@ -382,9 +382,14 @@ def main() -> int:
     step2_err = None
     step2_details: dict = {}
     try:
-        result = screen_stocks_legacy(board="all")
+        result = screen_stocks_legacy(
+            board="all",
+            top_n=200,
+            include_signal_confirmation=True,
+            include_springboard_scoring=True,
+        )
         symbols_info = result.get("symbols_for_report", []) or []
-        benchmark_context = {}
+        benchmark_context = result.get("benchmark_context", {}) or {}
         step2_details = {}
         step2_ok = True
         step2_err = None
@@ -404,6 +409,13 @@ def main() -> int:
         f"Step2 Wyckoff Funnel: ok={step2_ok}, symbols={len(symbols_info)}, elapsed={elapsed2:.1f}s, err={step2_err}",
         logs_path,
     )
+    if step2_ok:
+        _log(
+            "Step2 Strategy API口径: "
+            f"signal_confirmed={int(result.get('signal_confirmation_count') or 0)}, "
+            f"springboard_scored={int(result.get('springboard_scored_count') or 0)}",
+            logs_path,
+        )
     if step2_err:
         has_blocking_failure = True
     elif benchmark_context:

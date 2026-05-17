@@ -90,6 +90,16 @@ def test_screen_stocks_legacy_polls_task(monkeypatch):
                     "strategy_version": "private-v1",
                     "trade_date": "2026-05-15",
                     "total_scanned": 2,
+                    "benchmark_context": {"regime": "NEUTRAL"},
+                    "symbols_for_report": [
+                        {
+                            "code": "000001",
+                            "name": "平安银行",
+                            "priority_score": 82,
+                            "tag": "点火破局 | SOS",
+                            "track": "Trend",
+                        }
+                    ],
                     "candidates": [
                         {
                             "code": "000001",
@@ -115,6 +125,8 @@ def test_screen_stocks_legacy_polls_task(monkeypatch):
     assert result["source"] == "strategy_api"
     assert result["trade_date"] == "2026-05-15"
     assert result["symbols_for_report"][0]["code"] == "000001"
+    assert result["symbols_for_report"][0]["tag"] == "点火破局 | SOS"
+    assert result["benchmark_context"]["regime"] == "NEUTRAL"
 
 
 def test_run_backtest_legacy_polls_task(monkeypatch):

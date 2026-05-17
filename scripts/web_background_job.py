@@ -94,13 +94,15 @@ def _run_funnel_screen(request_id: str, payload: dict[str, Any]) -> dict[str, An
     remote = screen_stocks_legacy(board=board, universe=universe, top_n=top_n)
     symbols_for_report = remote.get("symbols_for_report", []) or []
     summary = remote.get("summary") or {}
+    benchmark_context = remote.get("benchmark_context", {}) or {}
+    selected_for_ai = remote.get("selected_for_ai") or [row.get("code") for row in symbols_for_report]
 
     return {
         "request_id": request_id,
         "job_kind": "funnel_screen",
         "ok": True,
         "source": "strategy_api",
-        "benchmark_context": {},
+        "benchmark_context": benchmark_context,
         "metrics": {
             "total_symbols": int(summary.get("total_scanned", 0) or 0),
             "strategy_version": remote.get("strategy_version"),
@@ -116,10 +118,10 @@ def _run_funnel_screen(request_id: str, payload: dict[str, Any]) -> dict[str, An
         },
         "trigger_groups": remote.get("trigger_groups", {}),
         "symbols_for_report": symbols_for_report,
-        "selected_for_ai": symbols_for_report,
-        "trend_selected": [],
-        "accum_selected": [],
-        "top_sectors": [],
+        "selected_for_ai": selected_for_ai,
+        "trend_selected": remote.get("trend_selected", []),
+        "accum_selected": remote.get("accum_selected", []),
+        "top_sectors": remote.get("top_sectors", []),
         "content_preview": json.dumps(symbols_for_report[:20], ensure_ascii=False),
     }
 

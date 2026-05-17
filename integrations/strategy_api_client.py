@@ -158,12 +158,16 @@ def _screen_payload(
     top_n: int,
     trade_date: str | None,
     strategy_version: str,
+    include_signal_confirmation: bool,
+    include_springboard_scoring: bool,
 ) -> dict[str, Any]:
     return {
         "trade_date": trade_date,
         "universe": [_clean_code(code) for code in universe] if universe else None,
         "board": _normalize_screen_board(board),
         "top_n": max(1, min(int(top_n or 20), 200)),
+        "include_signal_confirmation": bool(include_signal_confirmation),
+        "include_springboard_scoring": bool(include_springboard_scoring),
         "strategy_version": strategy_version,
     }
 
@@ -175,27 +179,65 @@ def _screen_candidate_rows(candidates: list[Any]) -> tuple[list[dict[str, Any]],
         if not isinstance(item, dict):
             continue
         score = _json_float(item.get("score")) or 0.0
+        reasons = item.get("reasons") or []
+        tag = str(item.get("tag") or item.get("recommend_reason") or "").strip()
+        if not tag and isinstance(reasons, list) and reasons:
+            tag = str(reasons[0] or "").strip()
         row = {
             "code": str(item.get("code") or ""),
             "name": str(item.get("name") or item.get("code") or ""),
             "score": score,
             "priority_score": score,
             "track": str(item.get("phase") or ""),
-            "tag": "strategy_api",
+            "tag": tag or "strategy_api",
             "risk_level": str(item.get("risk_level") or ""),
-            "reasons": item.get("reasons") or [],
+            "reasons": reasons,
         }
         symbols_for_report.append(row)
         trigger_rows.append({"code": row["code"], "name": row["name"], "score": row["score"]})
     return symbols_for_report, trigger_rows
 
 
+def _screen_report_rows(rows: list[Any]) -> list[dict[str, Any]]:
+    symbols_for_report: list[dict[str, Any]] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        code = str(row.get("code") or "").strip()
+        if not code:
+            continue
+        row["code"] = code
+        row["name"] = str(row.get("name") or code)
+        priority_score = _json_float(row.get("priority_score"))
+        score = _json_float(row.get("score"))
+        if priority_score is None and score is not None:
+            row["priority_score"] = score
+        if score is None and priority_score is not None:
+            row["score"] = priority_score
+        tag = str(row.get("tag") or row.get("recommend_reason") or "").strip()
+        if not tag:
+            reasons = row.get("reasons") or []
+            if isinstance(reasons, list) and reasons:
+                tag = str(reasons[0] or "").strip()
+        row["tag"] = tag or "strategy_api"
+        symbols_for_report.append(row)
+    return symbols_for_report
+
+
 def _screen_legacy_result(data: dict[str, Any]) -> dict[str, Any]:
     candidates = data.get("candidates") or []
     if not isinstance(candidates, list):
         candidates = []
-    symbols_for_report, trigger_rows = _screen_candidate_rows(candidates)
+    candidate_symbols, trigger_rows = _screen_candidate_rows(candidates)
+    raw_symbols = data.get("symbols_for_report") or []
+    symbols_for_report = _screen_report_rows(raw_symbols) if isinstance(raw_symbols, list) else []
+    if not symbols_for_report:
+        symbols_for_report = candidate_symbols
     total_scanned = int(data.get("total_scanned") or len(symbols_for_report))
+    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+    trigger_groups = data.get("trigger_groups") if isinstance(data.get("trigger_groups"), dict) else {}
+    selected_for_ai = data.get("selected_for_ai") if isinstance(data.get("selected_for_ai"), list) else []
     return {
         "ok": True,
         "source": "strategy_api",
@@ -203,13 +245,21 @@ def _screen_legacy_result(data: dict[str, Any]) -> dict[str, Any]:
         "trade_date": data.get("trade_date"),
         "summary": {
             "total_scanned": total_scanned,
-            "layer1_passed": total_scanned,
-            "layer2_passed": len(symbols_for_report),
-            "layer3_passed": len(symbols_for_report),
+            "layer1_passed": int(summary.get("layer1_passed") or total_scanned),
+            "layer2_passed": int(summary.get("layer2_passed") or len(symbols_for_report)),
+            "layer3_passed": int(summary.get("layer3_passed") or len(symbols_for_report)),
+            "l4_unique_hits": int(summary.get("l4_unique_hits") or len(symbols_for_report)),
+            "selected_for_ai": int(summary.get("selected_for_ai") or len(symbols_for_report)),
         },
-        "trigger_groups": {"strategy_api": trigger_rows},
-        "top_sectors": [],
+        "trigger_groups": trigger_groups or {"strategy_api": trigger_rows},
+        "top_sectors": data.get("top_sectors") if isinstance(data.get("top_sectors"), list) else [],
+        "benchmark_context": data.get("benchmark_context") if isinstance(data.get("benchmark_context"), dict) else {},
         "symbols_for_report": symbols_for_report,
+        "selected_for_ai": selected_for_ai or [row.get("code") for row in symbols_for_report],
+        "trend_selected": data.get("trend_selected") if isinstance(data.get("trend_selected"), list) else [],
+        "accum_selected": data.get("accum_selected") if isinstance(data.get("accum_selected"), list) else [],
+        "signal_confirmation_count": int(data.get("signal_confirmation_count") or 0),
+        "springboard_scored_count": int(data.get("springboard_scored_count") or 0),
         "candidates": candidates,
     }
 
@@ -269,6 +319,8 @@ def screen_stocks_legacy(
     universe: list[str] | None = None,
     top_n: int = 20,
     trade_date: str | None = None,
+    include_signal_confirmation: bool = False,
+    include_springboard_scoring: bool = False,
 ) -> dict[str, Any]:
     cfg = _require_config()
     payload = _screen_payload(
@@ -277,6 +329,8 @@ def screen_stocks_legacy(
         top_n=top_n,
         trade_date=trade_date,
         strategy_version=cfg.strategy_version,
+        include_signal_confirmation=include_signal_confirmation,
+        include_springboard_scoring=include_springboard_scoring,
     )
     try:
         accepted = _request("POST", "/v1/screen/jobs", json_payload=payload)
