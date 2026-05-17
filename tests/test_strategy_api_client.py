@@ -69,6 +69,54 @@ def test_analyze_stock_legacy_maps_public_response(monkeypatch):
     assert result["formatted_text"] == "public summary"
 
 
+def test_screen_stocks_legacy_polls_task(monkeypatch):
+    _configure_remote(monkeypatch)
+    calls: list[tuple[str, str]] = []
+
+    def fake_request(method, url, headers, json=None, timeout=0):
+        calls.append((method, url))
+        if url.endswith("/v1/screen/jobs"):
+            assert json["board"] == "all"
+            assert json["universe"] == ["000001", "600519"]
+            return FakeResponse(200, {"task_id": "screen-1", "status": "queued", "created_at": "2026-05-15T00:00:00Z"})
+        return FakeResponse(
+            200,
+            {
+                "task_id": "screen-1",
+                "status": "completed",
+                "created_at": "2026-05-15T00:00:00Z",
+                "completed_at": "2026-05-15T00:00:01Z",
+                "result": {
+                    "strategy_version": "private-v1",
+                    "trade_date": "2026-05-15",
+                    "total_scanned": 2,
+                    "candidates": [
+                        {
+                            "code": "000001",
+                            "name": "平安银行",
+                            "score": 82,
+                            "phase": "Trend",
+                            "risk_level": "low",
+                            "reasons": ["SOS"],
+                        }
+                    ],
+                },
+            },
+        )
+
+    monkeypatch.setattr(client.requests, "request", fake_request)
+
+    result = client.screen_stocks_legacy(board="main_chinext", universe=["1", "600519"], top_n=1)
+
+    assert calls == [
+        ("POST", "https://strategy.example/v1/screen/jobs"),
+        ("GET", "https://strategy.example/v1/tasks/screen-1"),
+    ]
+    assert result["source"] == "strategy_api"
+    assert result["trade_date"] == "2026-05-15"
+    assert result["symbols_for_report"][0]["code"] == "000001"
+
+
 def test_run_backtest_legacy_polls_task(monkeypatch):
     _configure_remote(monkeypatch)
     calls: list[tuple[str, str]] = []

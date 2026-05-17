@@ -271,17 +271,29 @@ def screen_stocks_legacy(
     trade_date: str | None = None,
 ) -> dict[str, Any]:
     cfg = _require_config()
-    data = _request(
-        "POST",
-        "/v1/screen",
-        json_payload=_screen_payload(
-            board=board,
-            universe=universe,
-            top_n=top_n,
-            trade_date=trade_date,
-            strategy_version=cfg.strategy_version,
-        ),
+    payload = _screen_payload(
+        board=board,
+        universe=universe,
+        top_n=top_n,
+        trade_date=trade_date,
+        strategy_version=cfg.strategy_version,
     )
+    try:
+        accepted = _request("POST", "/v1/screen/jobs", json_payload=payload)
+    except StrategyApiError as exc:
+        # Keep compatibility while the API deployment rolls forward.
+        if "Strategy API 404" not in str(exc):
+            raise
+        data = _request("POST", "/v1/screen", json_payload=payload)
+        return _screen_legacy_result(data)
+
+    task_id = str(accepted.get("task_id") or "").strip()
+    if not task_id:
+        raise StrategyApiError("Strategy API screen task did not return a task_id")
+    task = wait_for_task(task_id)
+    data = task.get("result") or {}
+    if not isinstance(data, dict):
+        raise StrategyApiError("Strategy API screen task result is not an object")
     return _screen_legacy_result(data)
 
 
