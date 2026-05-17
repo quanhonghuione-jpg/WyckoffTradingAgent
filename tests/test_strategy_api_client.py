@@ -178,6 +178,36 @@ def test_run_backtest_legacy_polls_task(monkeypatch):
     assert result["sharpe_ratio"] == 1.2
 
 
+def test_run_step4_rebalance_remote(monkeypatch):
+    _configure_remote(monkeypatch)
+    captured = {}
+
+    def fake_request(method, url, headers, json=None, timeout=0):
+        captured.update({"method": method, "url": url, "json": json, "key": headers["X-API-Key"]})
+        return FakeResponse(200, {"strategy_version": "private-v1", "ok": True, "reason": "ok"})
+
+    monkeypatch.setattr(client.requests, "request", fake_request)
+
+    result = client.run_step4_rebalance_remote(
+        external_report="report",
+        benchmark_context={"regime": "NEUTRAL"},
+        llm_api_key="llm",
+        model="gemini-test",
+        candidate_meta=[{"code": "603082"}],
+        portfolio_id="USER_LIVE:test",
+        tg_bot_token="tg",
+        tg_chat_id="chat",
+        holdings_intraday_report="holdings",
+    )
+
+    assert result["ok"] is True
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://strategy.example/v1/step4/rebalance"
+    assert captured["key"] == "secret"
+    assert captured["json"]["portfolio_id"] == "USER_LIVE:test"
+    assert captured["json"]["candidate_meta"] == [{"code": "603082"}]
+
+
 def test_tail_buy_remote_calls_score_endpoint(monkeypatch):
     _configure_remote(monkeypatch)
 

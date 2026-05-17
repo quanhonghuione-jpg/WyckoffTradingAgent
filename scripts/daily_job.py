@@ -262,6 +262,8 @@ def _run_step4_pipeline(
     model: str,
     logs_path: str | None,
 ) -> dict:
+    from integrations.strategy_api_client import run_step4_rebalance_remote
+
     t0 = datetime.now(TZ)
     tg_bot_token = os.getenv("TG_BOT_TOKEN", "").strip()
     tg_chat_id = os.getenv("TG_CHAT_ID", "").strip()
@@ -277,30 +279,53 @@ def _run_step4_pipeline(
 
     user_id = str(step4_target.get("user_id", "") or "").strip()
     portfolio_id = str(step4_target.get("portfolio_id", "") or "").strip()
-    del (
-        symbols_info,
-        step3_springboard_codes,
-        step3_report_text,
-        benchmark_context,
-        api_key,
-        model,
-        tg_bot_token,
-        tg_chat_id,
-    )
+    step4_candidate_meta: list[dict] = []
+    if step3_springboard_codes:
+        allowed_set = set(step3_springboard_codes)
+        for item in symbols_info:
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get("code", "")).strip()
+            if code in allowed_set:
+                step4_candidate_meta.append(item)
+    _log(f"Step4 私人再平衡(API): 候选收口为 Step3 起跳板 {len(step4_candidate_meta)} 只", logs_path)
 
     holdings_diag_text = _run_step4_holdings_diagnosis(portfolio_id, logs_path)
+    step4_ok = True
+    step4_reason = "ok"
+    step4_err = None
+    try:
+        payload = run_step4_rebalance_remote(
+            external_report=step3_report_text,
+            benchmark_context=benchmark_context,
+            llm_api_key=api_key,
+            model=model,
+            candidate_meta=step4_candidate_meta,
+            portfolio_id=portfolio_id,
+            tg_bot_token=tg_bot_token,
+            tg_chat_id=tg_chat_id,
+            holdings_intraday_report=holdings_diag_text,
+        )
+        step4_ok = bool(payload.get("ok"))
+        step4_reason = str(payload.get("reason") or "")
+        step4_err = None if step4_ok else STEP4_REASON_MAP.get(step4_reason, step4_reason)
+    except Exception as e:
+        step4_ok = False
+        step4_reason = "strategy_api_failed"
+        step4_err = str(e)
     elapsed4 = (datetime.now(TZ) - t0).total_seconds()
     _log(
         f"Step4 私人再平衡: user={user_id}, portfolio={portfolio_id}, "
-        f"skipped=local_strategy_disabled, holdings_diag_len={len(holdings_diag_text)}, elapsed={elapsed4:.1f}s",
+        f"source=strategy_api, ok={step4_ok}, reason={step4_reason}, "
+        f"holdings_diag_len={len(holdings_diag_text)}, elapsed={elapsed4:.1f}s, err={step4_err}",
         logs_path,
     )
     return {
         "step": "私人再平衡",
-        "ok": True,
-        "err": None,
+        "ok": step4_ok and step4_err is None,
+        "err": step4_err,
         "elapsed_s": round(elapsed4, 1),
-        "output": f"user={user_id}, portfolio={portfolio_id}, skipped=local_strategy_disabled",
+        "output": f"user={user_id}, portfolio={portfolio_id}, source=strategy_api, reason={step4_reason}",
     }
 
 

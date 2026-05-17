@@ -553,3 +553,34 @@ def analyze_tail_buy_holdings_remote(
             "hard_stop_pct": hard_stop_pct,
         },
     )
+
+
+def run_step4_rebalance_remote(
+    *,
+    external_report: str,
+    benchmark_context: dict[str, Any] | None,
+    llm_api_key: str,
+    model: str,
+    candidate_meta: list[dict[str, Any]] | None,
+    portfolio_id: str,
+    tg_bot_token: str,
+    tg_chat_id: str,
+    holdings_intraday_report: str = "",
+) -> dict[str, Any]:
+    cfg = _require_config()
+    return _request(
+        "POST",
+        "/v1/step4/rebalance",
+        json_payload={
+            "strategy_version": cfg.strategy_version,
+            "external_report": external_report,
+            "benchmark_context": benchmark_context or {},
+            "llm_api_key": llm_api_key,
+            "model": model,
+            "candidate_meta": candidate_meta or [],
+            "portfolio_id": portfolio_id,
+            "tg_bot_token": tg_bot_token,
+            "tg_chat_id": tg_chat_id,
+            "holdings_intraday_report": holdings_intraday_report,
+        },
+    )
