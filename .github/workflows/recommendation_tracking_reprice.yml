@@ -1,6 +1,9 @@
 name: Wyckoff Pattern Replay Reprice
 
 on:
+  schedule:
+    # 北京时间周一到周五 23:00，GitHub Actions 使用 UTC。
+    - cron: "0 15 * * 1-5"
   workflow_dispatch:
 
 concurrency:
