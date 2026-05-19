@@ -34,7 +34,7 @@ from textual.widgets.option_list import Option
 # ---------------------------------------------------------------------------
 # Widget
 # ---------------------------------------------------------------------------
-from cli.runtime import AgentRuntime
+from cli.runtime import AgentCancelled, AgentRuntime
 from cli.scratchpad import AgentScratchpad
 from core.prompts import with_current_time
 
@@ -366,6 +366,31 @@ class ToolConfirmScreen(ModalScreen[dict]):
 
     def action_cancel(self) -> None:
         self.dismiss({"action": "deny"})
+
+
+# ---------------------------------------------------------------------------
+# 错误友好化
+# ---------------------------------------------------------------------------
+
+
+def _friendly_error(e: Exception) -> str:
+    """将常见网络/超时异常转为用户可读的中文提示。"""
+    import re
+
+    cls_name = type(e).__name__
+    if isinstance(e, TimeoutError):
+        return "模型响应超时（60s 无数据），请检查网络"
+    if "RemoteProtocolError" in cls_name or "ReadError" in cls_name:
+        return "连接已断开，请检查网络后重试"
+    if "APIConnectionError" in cls_name or "ConnectError" in cls_name:
+        return "API 连接失败，请检查网络"
+    err = str(e)
+    if "<html" in err.lower():
+        title = re.search(r"<title>(.*?)</title>", err, re.IGNORECASE)
+        err = title.group(1) if title else "服务端返回 HTML 错误"
+    if len(err) > 200:
+        err = err[:200] + "..."
+    return err
 
 
 # ---------------------------------------------------------------------------
@@ -1515,7 +1540,7 @@ class WyckoffTUI(App):
 
             self._tools._tool_context.on_progress = _on_sub_agent_progress
 
-            runtime = AgentRuntime(self._provider, self._tools, scratchpad=_scratchpad)
+            runtime = AgentRuntime(self._provider, self._tools, scratchpad=_scratchpad, cancel_check=self._cancel_event.is_set)
             for event in runtime.run_stream(self._messages, with_current_time(self._system_prompt)):
                 if self._cancel_event.is_set():
                     _spinner_stop()
@@ -1671,21 +1696,22 @@ class WyckoffTUI(App):
                     )
                     break
 
+        except AgentCancelled:
+            _spinner_stop()
+            _flush_stream_line()
+            _write(Text.from_markup("[yellow]⏹ 已中断[/yellow]"))
+            _scroll()
+            while self._messages and self._messages[-1].get("role") != "user":
+                self._messages.pop()
+            if self._messages:
+                self._messages.pop()
+
         except Exception as e:
             _spinner_stop()
-            err = str(e)
-            # 清理 HTML 错误响应，只保留关键信息
-            if "<html" in err.lower():
-                import re
-
-                title = re.search(r"<title>(.*?)</title>", err, re.IGNORECASE)
-                err = title.group(1) if title else "服务端返回 HTML 错误"
-            if len(err) > 200:
-                err = err[:200] + "..."
+            err = _friendly_error(e)
             if _scratchpad:
                 _scratchpad.record_error(f"{type(e).__name__}: {err}", elapsed_s=time.monotonic() - t_start)
             _write(Text.from_markup(f"[red]错误: {err}[/red]"))
-            # 记录错误到日志和 SQLite
             _elapsed = time.monotonic() - t_start
             self._agent_log.error(
                 "session=%s error after=%.1fs type=%s msg=%s",
