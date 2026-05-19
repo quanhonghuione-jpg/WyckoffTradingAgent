@@ -99,7 +99,6 @@ jobs:
       BT_START: ${{ matrix.period.start }}
       BT_END: ${{ matrix.period.end }}
       OUT_DIR: analysis/backtest_grid_us/${{ matrix.period.key }}
-      BASE_DIR: analysis/backtest_grid_us/${{ matrix.period.key }}_base
     steps:
       - uses: actions/checkout@v4
 
@@ -120,40 +119,13 @@ jobs:
           name: backtest-us-snapshot-${{ matrix.period.key }}
           path: snapshot_data/
 
-      - name: Run baseline and six strategy replays
+      - name: Run six strategy replays
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$BASE_DIR" "$OUT_DIR"
-
-          python -u -m scripts.backtest_runner \
-            --start "$BT_START" \
-            --end "$BT_END" \
-            --hold-days 20 \
-            --top-n "$BT_TOP_N" \
-            --board us \
-            --benchmark SPY.US \
-            --trading-days "$BT_TRADING_DAYS" \
-            --use-current-meta \
-            --exit-mode close_only \
-            --stop-loss 0 \
-            --take-profit 0 \
-            --pending-mode both \
-            --pending-merge-order funnel_first \
-            --metrics-engine auto \
-            --wbt-n-jobs 2 \
-            --snapshot-dir snapshot_data \
-            --output-dir "$BASE_DIR" \
-            | tee "$BASE_DIR/run.log"
-
-          TRADES_CSV="$(find "$BASE_DIR" -maxdepth 1 -name 'trades_*.csv' | head -n 1)"
-          if [ -z "$TRADES_CSV" ]; then
-            echo "未找到 baseline trades_*.csv"
-            exit 1
-          fi
+          mkdir -p "$OUT_DIR"
 
           python -u scripts/us_backtest_strategy_replay.py \
-            --trades-csv "$TRADES_CSV" \
             --snapshot-dir snapshot_data \
             --output-dir "$OUT_DIR" \
             --period-key "$PERIOD_KEY" \
@@ -168,9 +140,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: backtest-us-grid-${{ matrix.period.key }}-${{ github.run_number }}
-          path: |
-            ${{ env.OUT_DIR }}/*
-            ${{ env.BASE_DIR }}/run.log
+          path: ${{ env.OUT_DIR }}/*
           retention-days: 7
           if-no-files-found: warn
 

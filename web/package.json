@@ -8,5 +8,10 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "pnpm": {
+    "overrides": {
+      "ws": "8.20.1"
+    }
   }
 }
