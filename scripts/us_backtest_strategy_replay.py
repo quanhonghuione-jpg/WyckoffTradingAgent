@@ -42,6 +42,17 @@ class ReplayTrade:
     score: float
 
 
+@dataclass(frozen=True)
+class SignalCandidate:
+    signal_date: str
+    entry_date: str
+    code: str
+    name: str
+    entry_close: float
+    trigger: str
+    score: float
+
+
 STRATEGIES = (
     StrategySpec(
         "s1_open_2x3x", "策略1", "开盘买入，2x/3x各卖50%，未成交按现价", "open", 0.0, (2.0, 3.0), "mark_to_market", 20
@@ -99,6 +110,14 @@ STRATEGIES = (
 )
 
 
+MIN_LOOKBACK_ROWS = 80
+MIN_PRICE = 1.0
+MAX_PRICE = 1_000.0
+MIN_DOLLAR_VOLUME = 1_000_000.0
+MAX_SPLITLIKE_DAILY_PCT = 120.0
+MAX_SPLITLIKE_PRICE_RATIO = 4.0
+
+
 def _parse_date(value: Any) -> date | None:
     try:
         return pd.to_datetime(value).date()
@@ -122,12 +141,195 @@ def _load_hist_map(snapshot_dir: Path) -> dict[str, pd.DataFrame]:
     return {str(sym): g.sort_values("date").reset_index(drop=True) for sym, g in df.groupby("symbol")}
 
 
+def _load_name_map(snapshot_dir: Path) -> dict[str, str]:
+    path = snapshot_dir / "name_map.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {str(k): str(v or k) for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+def _trade_calendar(snapshot_dir: Path, hist_map: dict[str, pd.DataFrame]) -> list[date]:
+    bench_path = snapshot_dir / "benchmark_main.csv"
+    if bench_path.exists():
+        bench = pd.read_csv(bench_path)
+        dates = pd.to_datetime(bench.get("date"), errors="coerce").dt.date.dropna().tolist()
+        if dates:
+            return sorted(set(dates))
+    return sorted({d for frame in hist_map.values() for d in frame["date"].tolist()})
+
+
 def _find_idx(candles: pd.DataFrame, target: date) -> int | None:
     dates = candles["date"].tolist()
     for idx, day in enumerate(dates):
         if day >= target:
             return idx
     return None
+
+
+def _volume(row: pd.Series) -> float:
+    return _safe_float(row.get("volume"))
+
+
+def _dollar_volume(row: pd.Series) -> float:
+    amount = _safe_float(row.get("amount"))
+    if amount > 0:
+        return amount
+    return _safe_float(row.get("close")) * _volume(row)
+
+
+def _candidate_from_slice(
+    code: str,
+    name: str,
+    tail: pd.DataFrame,
+    signal_date: date,
+    entry_date: date,
+) -> SignalCandidate | None:
+    row = tail.iloc[-1]
+    close = _safe_float(row.get("close"))
+    prev_close = _safe_float(tail.iloc[-2].get("close")) if len(tail) >= 2 else 0.0
+    if prev_close <= 0:
+        return None
+    stats = _signal_stats(tail, close, prev_close)
+    triggers, score = _signal_triggers(stats)
+    if not triggers:
+        return None
+    return SignalCandidate(
+        signal_date=signal_date.isoformat(),
+        entry_date=entry_date.isoformat(),
+        code=code,
+        name=name,
+        entry_close=round(close, 4),
+        trigger="+".join(triggers),
+        score=round(score, 4),
+    )
+
+
+def _signal_stats(tail: pd.DataFrame, close: float, prev_close: float) -> dict[str, float]:
+    prev_window = tail.iloc[:-1].tail(20)
+    high_20 = _safe_float(prev_window["high"].max())
+    low_20 = _safe_float(tail.tail(20)["low"].min())
+    vol_mean = _safe_float(prev_window["volume"].mean())
+    vol_ratio = _volume(tail.iloc[-1]) / vol_mean if vol_mean > 0 else 1.0
+    range_width = max(high_20 - low_20, close * 0.01)
+    return {
+        "pct": (close / prev_close - 1.0) * 100.0,
+        "vol_ratio": vol_ratio,
+        "range_pos": (close - low_20) / range_width,
+        "breakout_ratio": close / high_20 if high_20 > 0 else 0.0,
+        "ma20": _safe_float(tail.tail(20)["close"].mean()),
+        "ma50": _safe_float(tail.tail(50)["close"].mean()),
+        "pullback_from_high": (high_20 - close) / high_20 if high_20 > 0 else 0.0,
+    }
+
+
+def _signal_triggers(stats: dict[str, float]) -> tuple[list[str], float]:
+    triggers: list[str] = []
+    score = stats["pct"] * 1.2 + min(stats["vol_ratio"], 8.0) * 5.0 + stats["range_pos"] * 18.0
+    if stats["pct"] >= 5.0 and stats["vol_ratio"] >= 1.8 and stats["breakout_ratio"] >= 0.98:
+        triggers.append("SOS")
+        score += 30.0
+    if stats["vol_ratio"] >= 2.0 and stats["pct"] >= -2.0 and stats["range_pos"] >= 0.55:
+        triggers.append("EVR")
+        score += 18.0
+    if _is_lps_like(stats):
+        triggers.append("LPS")
+        score += 14.0
+    return triggers, score
+
+
+def _is_lps_like(stats: dict[str, float]) -> bool:
+    return (
+        stats["ma20"] > 0
+        and stats["ma50"] > 0
+        and stats["ma20"] >= stats["ma50"] * 0.96
+        and 0.06 <= stats["pullback_from_high"] <= 0.30
+        and -2.5 <= stats["pct"] <= 4.0
+        and stats["vol_ratio"] <= 1.5
+        and stats["range_pos"] >= 0.45
+    )
+
+
+def _has_price_discontinuity(candles: pd.DataFrame, start_idx: int, end_idx: int) -> bool:
+    for pos in range(max(1, start_idx), min(end_idx, len(candles) - 1) + 1):
+        row = candles.iloc[pos]
+        prev_close = _safe_float(candles.iloc[pos - 1].get("close"))
+        if _is_splitlike_row(row, prev_close):
+            return True
+    return False
+
+
+def _is_splitlike_row(row: pd.Series, prev_close: float) -> bool:
+    open_px = _safe_float(row.get("open"))
+    close_px = _safe_float(row.get("close"))
+    pct = _safe_float(row.get("pct_chg"))
+    if abs(pct) > MAX_SPLITLIKE_DAILY_PCT or prev_close <= 0:
+        return abs(pct) > MAX_SPLITLIKE_DAILY_PCT
+    open_ratio = open_px / prev_close if open_px > 0 else 1.0
+    close_ratio = close_px / prev_close if close_px > 0 else 1.0
+    return (
+        open_ratio > MAX_SPLITLIKE_PRICE_RATIO
+        or close_ratio > MAX_SPLITLIKE_PRICE_RATIO
+        or open_ratio < 1.0 / MAX_SPLITLIKE_PRICE_RATIO
+        or close_ratio < 1.0 / MAX_SPLITLIKE_PRICE_RATIO
+    )
+
+
+def _generate_signal_rows(
+    hist_map: dict[str, pd.DataFrame],
+    name_map: dict[str, str],
+    calendar: list[date],
+    start: date,
+    end: date,
+    top_n: int,
+) -> list[dict[str, Any]]:
+    next_by_date = {day: calendar[idx + 1] for idx, day in enumerate(calendar[:-1])}
+    by_day: dict[date, list[SignalCandidate]] = {}
+    for code, candles in hist_map.items():
+        _collect_symbol_candidates(code, candles, name_map.get(code, code), next_by_date, start, end, by_day)
+
+    rows: list[dict[str, Any]] = []
+    for signal_date in calendar:
+        if not start <= signal_date < end:
+            continue
+        day_rows = sorted(by_day.get(signal_date, []), key=lambda item: item.score, reverse=True)
+        rows.extend(asdict(item) for item in day_rows[: max(int(top_n), 1)])
+    return rows
+
+
+def _collect_symbol_candidates(
+    code: str,
+    candles: pd.DataFrame,
+    name: str,
+    next_by_date: dict[date, date],
+    start: date,
+    end: date,
+    by_day: dict[date, list[SignalCandidate]],
+) -> None:
+    for pos in range(MIN_LOOKBACK_ROWS - 1, len(candles)):
+        signal_date = candles.iloc[pos]["date"]
+        if not start <= signal_date < end:
+            continue
+        entry_date = next_by_date.get(signal_date)
+        if entry_date is None or entry_date > end:
+            continue
+        row = candles.iloc[pos]
+        prev_close = _safe_float(candles.iloc[pos - 1].get("close")) if pos > 0 else 0.0
+        close = _safe_float(row.get("close"))
+        if (
+            not MIN_PRICE <= close <= MAX_PRICE
+            or prev_close <= 0
+            or _dollar_volume(row) < MIN_DOLLAR_VOLUME
+            or _is_splitlike_row(row, prev_close)
+        ):
+            continue
+        tail = candles.iloc[pos - MIN_LOOKBACK_ROWS + 1 : pos + 1]
+        candidate = _candidate_from_slice(code, name, tail, signal_date, entry_date)
+        if candidate is not None:
+            by_day.setdefault(signal_date, []).append(candidate)
 
 
 def _entry(strategy: StrategySpec, candles: pd.DataFrame, idx: int, base_price: float) -> tuple[int, float] | None:
@@ -140,14 +342,7 @@ def _entry(strategy: StrategySpec, candles: pd.DataFrame, idx: int, base_price: 
         if _safe_float(row["low"], math.inf) <= target:
             open_px = _safe_float(row["open"], target)
             return pos, min(open_px, target)
-    if last_idx <= idx and len(candles) <= idx + 1:
-        return None
-    row = candles.iloc[last_idx]
-    if strategy.fallback_rule == "original_or_mark" and last_idx >= idx + strategy.max_days:
-        return last_idx, base_price
-    if last_idx >= idx + strategy.max_days:
-        return last_idx, _safe_float(row["open"], base_price)
-    return last_idx, _safe_float(row["close"], base_price)
+    return None
 
 
 def _fallback_exit(strategy: StrategySpec, candles: pd.DataFrame, idx: int, buy_price: float) -> tuple[int, float]:
@@ -163,11 +358,7 @@ def _exit(strategy: StrategySpec, candles: pd.DataFrame, buy_idx: int, buy_price
     start_idx = buy_idx + 1
     if start_idx >= len(candles):
         return None
-    end_idx = (
-        len(candles) - 1
-        if strategy.fallback_rule == "mark_to_market"
-        else min(buy_idx + strategy.max_days, len(candles) - 1)
-    )
+    end_idx = min(buy_idx + strategy.max_days, len(candles) - 1)
     proceeds = 0.0
     remaining = 1.0
     latest_exit_idx = start_idx
@@ -177,8 +368,7 @@ def _exit(strategy: StrategySpec, candles: pd.DataFrame, buy_idx: int, buy_price
         hit_idx = _target_hit_idx(candles, scan_idx, end_idx, target)
         if hit_idx is None:
             continue
-        open_px = _safe_float(candles.iloc[hit_idx]["open"], target)
-        proceeds += 0.5 * max(open_px, target)
+        proceeds += 0.5 * target
         remaining -= 0.5
         latest_exit_idx = hit_idx
         scan_idx = hit_idx
@@ -208,13 +398,74 @@ def _replay_one(row: dict[str, Any], hist_map: dict[str, pd.DataFrame], strategy
         return None
     entry = _entry(strategy, candles, idx, base_price)
     if entry is None:
-        return None
+        if _has_price_discontinuity(candles, idx + 1, min(idx + strategy.max_days, len(candles) - 1)):
+            return None
+        return _unfilled_trade(row, candles, idx, strategy, base_price)
     buy_idx, buy_price = entry
+    if _has_price_discontinuity(candles, idx + 1, min(buy_idx + strategy.max_days, len(candles) - 1)):
+        return None
     exit_result = _exit(strategy, candles, buy_idx, buy_price)
     if exit_result is None or buy_price <= 0:
         return None
     exit_idx, exit_value = exit_result
     return _trade_from_result(row, candles, buy_idx, exit_idx, buy_price, exit_value)
+
+
+def _unfilled_trade(
+    row: dict[str, Any],
+    candles: pd.DataFrame,
+    idx: int,
+    strategy: StrategySpec,
+    base_price: float,
+) -> ReplayTrade:
+    fallback_idx = min(idx + strategy.max_days, len(candles) - 1)
+    fallback_row = candles.iloc[fallback_idx]
+    full_window = fallback_idx >= idx + strategy.max_days
+    if strategy.fallback_rule == "original_or_mark" and full_window:
+        exit_value = base_price
+    elif strategy.fallback_rule == "open_after_3d" and full_window:
+        exit_value = _safe_float(fallback_row.get("open"), base_price)
+    else:
+        exit_value = _safe_float(fallback_row.get("close"), base_price)
+    trigger = str(row.get("trigger") or "")
+    return ReplayTrade(
+        signal_date=str(row.get("signal_date") or ""),
+        entry_date=str(row.get("entry_date") or candles.iloc[idx]["date"]),
+        exit_date=str(fallback_row["date"]),
+        code=str(row.get("code") or ""),
+        name=str(row.get("name") or row.get("code") or ""),
+        buy_price=round(base_price, 4),
+        exit_value=round(exit_value, 4),
+        ret_pct=round((exit_value / base_price - 1.0) * 100.0, 4) if base_price > 0 else 0.0,
+        trigger=f"{trigger}|NO_FILL" if trigger else "NO_FILL",
+        score=_safe_float(row.get("score")),
+    )
+
+
+def _load_input_rows(
+    args: argparse.Namespace, hist_map: dict[str, pd.DataFrame], snapshot_dir: Path
+) -> list[dict[str, Any]]:
+    if args.trades_csv:
+        path = Path(args.trades_csv)
+        if path.exists() and path.stat().st_size > 0:
+            try:
+                rows = pd.read_csv(path).to_dict("records")
+            except pd.errors.EmptyDataError:
+                rows = []
+            if rows:
+                return rows
+    start = _parse_date(args.start)
+    end = _parse_date(args.end)
+    if start is None or end is None:
+        raise ValueError("start/end must be valid dates")
+    return _generate_signal_rows(
+        hist_map,
+        _load_name_map(snapshot_dir),
+        _trade_calendar(snapshot_dir, hist_map),
+        start,
+        end,
+        int(args.top_n),
+    )
 
 
 def _trade_from_result(
@@ -286,7 +537,7 @@ def _write_outputs(out_dir: Path, strategy: StrategySpec, summary: dict[str, Any
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Replay US backtest trades with six explicit strategy rules.")
-    parser.add_argument("--trades-csv", required=True)
+    parser.add_argument("--trades-csv", default="")
     parser.add_argument("--snapshot-dir", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--period-key", required=True)
@@ -296,8 +547,10 @@ def main() -> int:
     parser.add_argument("--top-n", default="2")
     args = parser.parse_args()
 
-    rows = pd.read_csv(args.trades_csv).to_dict("records")
-    hist_map = _load_hist_map(Path(args.snapshot_dir))
+    snapshot_dir = Path(args.snapshot_dir)
+    hist_map = _load_hist_map(snapshot_dir)
+    rows = _load_input_rows(args, hist_map, snapshot_dir)
+    print(f"[us-replay] input signals={len(rows)}")
     period = {"key": args.period_key, "label": args.period_label, "start": args.start, "end": args.end}
     for strategy in STRATEGIES:
         trades = [t for row in rows if (t := _replay_one(row, hist_map, strategy)) is not None]
