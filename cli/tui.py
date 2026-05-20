@@ -40,20 +40,15 @@ import re as _re
 
 _KITTY_ENABLE = "\x1b[>1u"
 _KITTY_DISABLE = "\x1b[<u"
-_CSI_U_RE = _re.compile(r"\x1b\[\d+(?::\d+)*;?;?([\d:]+)?u")
+_CSI_U_IME_RE = _re.compile(r"\x1b\[\d+(?::\d+)*;;([\d:]+)u")
 
 
 def _decode_csi_u(m: _re.Match) -> str:
     text_field = m.group(1)
-    if text_field:
-        try:
-            return "".join(chr(int(cp)) for cp in text_field.split(":") if cp)
-        except (ValueError, OverflowError):
-            pass
-    codepoint = int(m.group(0).split("[")[1].split(";")[0].split(":")[0])
-    if 32 <= codepoint <= 0x10FFFF:
-        return chr(codepoint)
-    return ""
+    try:
+        return "".join(chr(int(cp)) for cp in text_field.split(":") if cp)
+    except (ValueError, OverflowError):
+        return m.group(0)
 
 
 def _make_csi_u_input_thread(driver_self) -> None:
@@ -83,7 +78,7 @@ def _make_csi_u_input_thread(driver_self) -> None:
                 if not unicode_data:
                     break
                 if "\x1b[" in unicode_data and "u" in unicode_data:
-                    unicode_data = _CSI_U_RE.sub(_decode_csi_u, unicode_data)
+                    unicode_data = _CSI_U_IME_RE.sub(_decode_csi_u, unicode_data)
                 if unicode_data:
                     for event in feed(unicode_data):
                         driver_self.process_message(event)
