@@ -33,25 +33,23 @@ from textual.widgets.option_list import Option
 # ---------------------------------------------------------------------------
 # 禁用 kitty keyboard protocol（与 macOS 中文输入法冲突）
 # ---------------------------------------------------------------------------
+_KITTY_ENABLE = "\x1b[>1u"
+_KITTY_DISABLE = "\x1b[<u"
+
+
 def _patch_driver_no_kitty() -> None:
     from textual.drivers.linux_driver import LinuxDriver
 
-    _orig_start = LinuxDriver.start_application_mode
+    _orig_write = LinuxDriver.write
 
-    def _patched_start(self, *args, **kwargs):
-        _orig_write = self.write
+    def _filtered_write(self, data: str) -> None:
+        if _KITTY_ENABLE in data or _KITTY_DISABLE in data:
+            data = data.replace(_KITTY_ENABLE, "").replace(_KITTY_DISABLE, "")
+            if not data:
+                return
+        _orig_write(self, data)
 
-        def _filtered_write(data: str) -> None:
-            if "\x1b[>1u" in data:
-                data = data.replace("\x1b[>1u", "")
-            if data:
-                _orig_write(data)
-
-        self.write = _filtered_write
-        _orig_start(self, *args, **kwargs)
-        self.write = _orig_write
-
-    LinuxDriver.start_application_mode = _patched_start
+    LinuxDriver.write = _filtered_write
 
 
 _patch_driver_no_kitty()
