@@ -119,3 +119,27 @@ def test_limit_down_locked_day_cannot_exit():
 
     assert trades[0].exit_date == "2026-01-04"
     assert trades[0].exit_reason == "stop_loss"
+
+
+def test_period_end_limit_down_locked_position_stays_open():
+    hist_map = {
+        "A": _hist(
+            [
+                ("2026-01-01", 10, 10, 10, 10),
+                ("2026-01-02", 10, 10, 10, 10),
+                ("2026-01-03", 8, 8, 8, 8),
+            ]
+        )
+    }
+
+    trades, nav = replay_portfolio(
+        hist_map,
+        [_candidate("A", "2026-01-01", "2026-01-02")],
+        [date(2026, 1, 1), date(2026, 1, 2), date(2026, 1, 3)],
+        4,
+        -8,
+        -5,
+    )
+
+    assert trades == []
+    assert nav[-1]["positions"] == 1

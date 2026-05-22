@@ -389,7 +389,12 @@ def _close_positions(
 ) -> tuple[list[ReplayTrade], float]:
     trades: list[ReplayTrade] = []
     for pos in positions:
-        row = _row_on(hist_map[pos.code], day)
+        df = hist_map[pos.code]
+        row = _row_on(df, day)
+        prev = df[df["date"] < day].tail(1)
+        prev_close = _safe_float(prev.iloc[-1].get("close")) if not prev.empty else pos.entry_price
+        if row is not None and _limit_down_locked(row, prev_close):
+            continue
         px = _safe_float(row.get("close")) if row is not None else pos.peak_close
         trade, proceeds = _trade(pos, day, px, "period_end")
         trades.append(trade)

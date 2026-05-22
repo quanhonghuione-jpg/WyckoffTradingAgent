@@ -237,7 +237,14 @@ def _load_today_review_codes(all_codes: list[str], name_map_today: dict[str, str
     spot_min_coverage = _review_spot_min_coverage()
     spot_coverage = spot_usable / max(len(all_codes), 1)
     if spot_usable > 0 and spot_coverage >= spot_min_coverage:
-        return _fetch_and_filter_review_codes(spot_codes, name_map_today, today_window)
+        if spot_codes:
+            review_codes = _fetch_and_filter_review_codes(spot_codes, name_map_today, today_window)
+            if review_codes:
+                return review_codes
+            print("[review] 实时快照候选经三日校验为空，回退到全量 OHLCV 校验")
+        else:
+            print("[review] 实时快照未发现今日候选，回退到全量 OHLCV 校验")
+        return _fetch_and_filter_review_codes(all_codes, name_map_today, today_window)
 
     if spot_usable <= 0:
         print("[review] 实时快照不可用，回退到三日 OHLCV 拉取")

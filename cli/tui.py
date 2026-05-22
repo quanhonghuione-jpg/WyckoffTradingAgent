@@ -16,8 +16,6 @@ import uuid
 from collections import deque
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
 from rich.highlighter import Highlighter
 from rich.markdown import Markdown
 from rich.text import Text
@@ -29,6 +27,8 @@ from textual.screen import ModalScreen
 from textual.widgets import Input, OptionList, RichLog, Static
 from textual.widgets.option_list import Option
 
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # 禁用 kitty keyboard protocol（与 macOS 中文输入法冲突）
@@ -36,14 +36,12 @@ from textual.widgets.option_list import Option
 # 中文 IME 产生的序列含冒号分隔的 Unicode codepoints，textual 无法解析
 # 策略：输出侧阻止启用 kitty protocol + 输入侧将 CSI-u 解码为纯文本
 # ---------------------------------------------------------------------------
-import re as _re
-
 _KITTY_ENABLE = "\x1b[>1u"
 _KITTY_DISABLE = "\x1b[<u"
-_CSI_U_IME_RE = _re.compile(r"\x1b\[\d+(?::\d+)*;;([\d:]+)u")
+_CSI_U_IME_RE = re.compile(r"\x1b\[\d+(?::\d+)*;;([\d:]+)u")
 
 
-def _decode_csi_u(m: _re.Match) -> str:
+def _decode_csi_u(m: re.Match[str]) -> str:
     text_field = m.group(1)
     try:
         return "".join(chr(int(cp)) for cp in text_field.split(":") if cp)
@@ -93,7 +91,7 @@ def _make_csi_u_input_thread(driver_self) -> None:
     finally:
         selector.close()
         try:
-            for event in feed(""):
+            for _event in feed(""):
                 pass
         except Exception:
             pass

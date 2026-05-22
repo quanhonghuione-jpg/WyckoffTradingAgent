@@ -10,6 +10,7 @@ from scripts.review_list_replay import (
     _build_report_lines,
     _find_big_gainers,
     _format_recommendation_history,
+    _load_today_review_codes,
     _normalize_code6,
     _short_code_list,
 )
@@ -63,6 +64,28 @@ def test_find_big_gainers_excludes_hot_previous_day():
     codes = _find_big_gainers({"000001": df}, {"000001": "平安银行"})
 
     assert codes == []
+
+
+def test_load_today_review_codes_falls_back_when_spot_candidates_empty(monkeypatch):
+    from integrations import data_source
+
+    monkeypatch.setattr(
+        data_source,
+        "_load_spot_snapshot_map",
+        lambda force_refresh: {"000001": {"pct_chg": 0.0}, "000002": {"pct_chg": 0.0}},
+    )
+    calls = []
+
+    def fake_fetch(codes, name_map, window):
+        calls.append(list(codes))
+        return ["000001"]
+
+    monkeypatch.setattr("scripts.review_list_replay._fetch_and_filter_review_codes", fake_fetch)
+
+    codes = _load_today_review_codes(["000001", "000002"], {"000001": "平安银行", "000002": "万科A"}, object())
+
+    assert codes == ["000001"]
+    assert calls == [["000001", "000002"]]
 
 
 def test_build_focus_lines_highlights_actionable_buckets():
