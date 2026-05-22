@@ -147,8 +147,8 @@ class ClaudeProvider(LLMProvider):
 
             elif role == "assistant":
                 content = []
-                if msg.get("reasoning_content"):
-                    content.append({"type": "thinking", "thinking": msg["reasoning_content"]})
+                # Anthropic thinking blocks must round-trip with their original signature.
+                # The runtime stores only display text, so replaying it would make tool loops 400.
                 if msg.get("content"):
                     content.append({"type": "text", "text": msg["content"]})
                 for tc in msg.get("tool_calls", []):
