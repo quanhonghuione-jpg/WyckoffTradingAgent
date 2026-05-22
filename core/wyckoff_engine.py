@@ -171,7 +171,7 @@ class FunnelConfig:
 
     # Layer 4 - Spring
     spring_support_window: int = 60
-    spring_vol_ratio: float = 1.1  # 放宽以激活 Accum 轨（原 1.3 导致 Spring 几乎不触发）
+    spring_vol_ratio: float = 1.5
     spring_tr_max_range_pct: float = 30.0
     spring_tr_max_drift_pct: float = 12.0
     # Spring 动态振幅
@@ -222,7 +222,7 @@ class FunnelConfig:
     sos_pct_min: float = 6.0  # 提高门槛过滤弱突破（原 4.5 追高触发止损率极高）
     sos_vol_ratio: float = 2.5  # 要求更强量能确认（原 2.0 噪音太多）
     sos_vol_window: int = 20  # 计算点火爆量时的参考窗口
-    sos_breakout_window: int = 20  # 要求突破或接近近 N 日的高点
+    sos_breakout_window: int = 10
     sos_breakout_tolerance: float = 0.01  # 改为 0.01：突破容差 1%（从 2% 改为 1%）
     sos_max_bias_200: float = 35.0  # 放宽以覆盖从底部启动的加速股（原20%过紧）
     # SOS 动态极值爆量
