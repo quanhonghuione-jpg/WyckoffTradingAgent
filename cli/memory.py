@@ -163,7 +163,10 @@ def _find_duplicate(memory_type: str, content: str, provider: Any) -> int | None
     user_text = "已有记忆:\n" + "\n".join(lines) + f"\n\n新记忆:\n{content}"
     result = _provider_text(provider, user_text, _DEDUP_PROMPT).strip()
     match = re.match(r"DUPLICATE[:\s]*#?(\d+)", result)
-    return int(match.group(1)) if match else None
+    if not match:
+        return None
+    duplicate_id = int(match.group(1))
+    return duplicate_id if any(m["id"] == duplicate_id for m in existing) else None
 
 
 def _save_summary_memories(summary: str, codes: str, source_ref: str, dedup_provider: Any = None) -> int:
@@ -172,7 +175,11 @@ def _save_summary_memories(summary: str, codes: str, source_ref: str, dedup_prov
     saved = 0
     for memory_type, content in _summary_memories(summary):
         if dedup_provider:
-            dup_id = _find_duplicate(memory_type, content, dedup_provider)
+            try:
+                dup_id = _find_duplicate(memory_type, content, dedup_provider)
+            except Exception:
+                logger.debug("memory dedup check failed", exc_info=True)
+                dup_id = None
             if dup_id:
                 logger.debug("memory dedup: '%s' duplicates #%d", content[:50], dup_id)
                 continue

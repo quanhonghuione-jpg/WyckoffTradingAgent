@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from cli.memory import _extract_keywords, build_memory_context, extract_stock_codes, save_session_summary
+from cli.memory import (
+    _extract_keywords,
+    _save_summary_memories,
+    build_memory_context,
+    extract_stock_codes,
+    save_session_summary,
+)
 
 
 class _Provider:
@@ -9,6 +15,11 @@ class _Provider:
 
     def chat_stream(self, *_args):
         yield {"type": "text_delta", "text": self.outputs.pop(0)}
+
+
+class _FailingProvider:
+    def chat_stream(self, *_args):
+        raise RuntimeError("dedup unavailable")
 
 
 def _init_tmp_db(monkeypatch, tmp_path):
@@ -113,5 +124,43 @@ class TestSaveSessionSummary:
             types = {m["memory_type"] for m in memories}
             assert types == {"decision", "preference"}
             assert any(m["source_ref"] == "chat_log:s1" for m in memories)
+        finally:
+            _close_tmp_db(local_db)
+
+    def test_dedup_unknown_duplicate_id_still_saves(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            local_db.save_memory("preference", "旧偏好", codes="000001")
+            existing = local_db.get_recent_memories(memory_type="preference", limit=10)
+            unknown_id = max(m["id"] for m in existing) + 1
+
+            saved = _save_summary_memories(
+                "[偏好] 新偏好",
+                "000001",
+                "chat_log:s2",
+                _Provider([f"DUPLICATE:{unknown_id}"]),
+            )
+
+            memories = local_db.get_recent_memories(memory_type="preference", limit=10)
+            assert saved == 1
+            assert any(m["content"] == "新偏好" for m in memories)
+        finally:
+            _close_tmp_db(local_db)
+
+    def test_dedup_failure_still_saves(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            local_db.save_memory("preference", "旧偏好", codes="000001")
+
+            saved = _save_summary_memories(
+                "[偏好] 新偏好",
+                "000001",
+                "chat_log:s2",
+                _FailingProvider(),
+            )
+
+            memories = local_db.get_recent_memories(memory_type="preference", limit=10)
+            assert saved == 1
+            assert any(m["content"] == "新偏好" for m in memories)
         finally:
             _close_tmp_db(local_db)
