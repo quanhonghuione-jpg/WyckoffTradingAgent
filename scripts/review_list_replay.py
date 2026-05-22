@@ -26,6 +26,7 @@ from scripts.wyckoff_funnel import run_funnel_job
 from utils.feishu import send_feishu_notification
 
 TODAY_REVIEW_MIN_PCT = 8.0
+TODAY_OPEN_MAX_PCT = 4.0
 PREVIOUS_REVIEW_MAX_PCT = 6.0
 
 
@@ -111,15 +112,21 @@ def _build_hit_map(triggers: dict[str, list[tuple[str, float]]]) -> dict[str, li
     return hit_map
 
 
-def _latest_two_pct_changes(df: pd.DataFrame) -> tuple[float | None, float | None]:
+def _latest_pct_and_open(df: pd.DataFrame) -> tuple[float | None, float | None, float | None]:
+    """返回 (今日涨幅%, 今日开盘涨幅%, 前一日涨幅%)。"""
     s = _sorted_if_needed(df)
     close = pd.to_numeric(s.get("close"), errors="coerce").dropna()
+    open_col = s.get("open")
+    open_s = pd.to_numeric(open_col, errors="coerce") if open_col is not None else None
     latest_pct = None
+    open_pct = None
     previous_pct = None
     if len(close) >= 2:
         prev_close = float(close.iloc[-2])
         if prev_close > 0:
             latest_pct = (float(close.iloc[-1]) / prev_close - 1.0) * 100.0
+            if open_s is not None and len(open_s) >= len(close) and pd.notna(open_s.iloc[-1]):
+                open_pct = (float(open_s.iloc[-1]) / prev_close - 1.0) * 100.0
     if len(close) >= 3:
         prev_prev_close = float(close.iloc[-3])
         if prev_prev_close > 0:
@@ -130,13 +137,14 @@ def _latest_two_pct_changes(df: pd.DataFrame) -> tuple[float | None, float | Non
         latest_pct = float(pct.iloc[-1])
     if previous_pct is None and len(pct) >= 2 and pd.notna(pct.iloc[-2]):
         previous_pct = float(pct.iloc[-2])
-    return latest_pct, previous_pct
+    return latest_pct, open_pct, previous_pct
 
 
 def _find_big_gainers(
     df_map: dict[str, pd.DataFrame],
     name_map: dict[str, str],
     today_threshold: float = TODAY_REVIEW_MIN_PCT,
+    open_max: float = TODAY_OPEN_MAX_PCT,
     previous_max: float = PREVIOUS_REVIEW_MAX_PCT,
 ) -> list[str]:
     codes: list[str] = []
@@ -147,11 +155,12 @@ def _find_big_gainers(
             continue
         if df is None or df.empty:
             continue
-        latest_pct, previous_pct = _latest_two_pct_changes(df)
+        latest_pct, open_pct, previous_pct = _latest_pct_and_open(df)
         if (
             latest_pct is not None
             and previous_pct is not None
             and latest_pct >= today_threshold
+            and (open_pct is None or open_pct <= open_max)
             and previous_pct <= previous_max
         ):
             codes.append(code)
@@ -163,8 +172,9 @@ def _find_big_gainers_from_spot(
     spot_map: dict[str, dict],
     name_map: dict[str, str],
     threshold: float = TODAY_REVIEW_MIN_PCT,
+    open_max: float = TODAY_OPEN_MAX_PCT,
 ) -> tuple[list[str], int]:
-    """从全市场实时快照中找出涨幅 >= threshold% 的主板+创业板非ST股票。"""
+    """从全市场实时快照中找出涨幅 >= threshold% 且开盘涨幅 <= open_max% 的主板+创业板非ST股票。"""
     codes: list[str] = []
     usable = 0
     for code, snap in (spot_map or {}).items():
@@ -180,8 +190,18 @@ def _find_big_gainers_from_spot(
             if pct is None:
                 continue
             usable += 1
-            if float(pct) >= threshold:
-                codes.append(code)
+            pct_f = float(pct)
+            if pct_f < threshold:
+                continue
+            open_v = snap.get("open")
+            close_v = snap.get("close")
+            if open_v is not None and close_v is not None and pct_f != -100.0:
+                pre_close = float(close_v) / (1.0 + pct_f / 100.0)
+                if pre_close > 0:
+                    open_pct = (float(open_v) / pre_close - 1.0) * 100.0
+                    if open_pct > open_max:
+                        continue
+            codes.append(code)
         except Exception:
             continue
     codes.sort()
@@ -346,10 +366,18 @@ def _load_recommendation_lookup(codes: list[str]) -> tuple[dict[str, list[dict]]
         return {}, "推荐表读取失败，无法确认是否被推荐过"
 
 
-def _format_recommendation_history(code: str, lookup: dict[str, list[dict]], load_error: str = "") -> str:
+def _format_recommendation_history(
+    code: str,
+    lookup: dict[str, list[dict]],
+    load_error: str = "",
+    exclude_date: date | None = None,
+) -> str:
     if load_error:
         return f"推荐记录: {load_error}"
     records = lookup.get(_normalize_code6(code), [])
+    if exclude_date:
+        exclude_str = exclude_date.strftime("%Y-%m-%d")
+        records = [r for r in records if _normalize_recommend_date(r.get("recommend_date")) != exclude_str]
     if not records:
         return "推荐记录: 此股没被推荐过"
 
@@ -429,7 +457,7 @@ def _build_report_lines(
     lines = [
         f"**今日**: {today}",
         f"**前一日漏斗**: {end_trade_date}",
-        f"**今日≥+8%且前一日≤+6%股票数**: {len(rows)}",
+        f"**今日≥+8%且今日开盘≤+4%且前一日≤+6%股票数**: {len(rows)}",
         f"**结果汇总**: {summary}",
         f"**推荐表交叉检查**: 命中{recommendation_hits}只 | 未推荐{len(rows) - recommendation_hits - recommendation_unknown}只"
         + (f" | 无法确认{recommendation_unknown}只" if recommendation_unknown else ""),
@@ -453,7 +481,7 @@ def main() -> int:
         print("[review] FEISHU_WEBHOOK_URL 未配置")
         return 2
 
-    print("[review] 获取今日涨幅 ≥ 8% 且前一日涨幅 ≤ 6% 股票...")
+    print("[review] 获取今日≥+8%且今日开盘≤+4%且前一日≤+6% 股票...")
     from datetime import timedelta
 
     from integrations.fetch_a_share_csv import _resolve_trading_window, get_stocks_by_board
@@ -476,11 +504,11 @@ def main() -> int:
     review_codes = _load_today_review_codes(all_codes, name_map_today, today_window)
 
     if not review_codes:
-        print("[review] 今日无满足涨幅 ≥ 8% 且前一日涨幅 ≤ 6% 的股票，跳过")
+        print("[review] 今日无满足涨幅 ≥ 8% 且开盘 ≤ 4% 且前一日涨幅 ≤ 6% 的股票，跳过")
         send_feishu_notification(
             webhook,
             "🔍 涨停复盘",
-            f"交易日 {today}：今日无满足涨幅 ≥ 8% 且前一日涨幅 ≤ 6% 的主板/创业板股票",
+            f"交易日 {today}：今日无满足涨幅 ≥ 8% 且开盘 ≤ 4% 且前一日涨幅 ≤ 6% 的主板/创业板股票",
         )
         return 0
     print(f"[review] 今日发现满足严格涨停复盘池股票 {len(review_codes)} 只: {', '.join(review_codes)}")
@@ -581,7 +609,7 @@ def main() -> int:
                 "name": name,
                 "stage": stage,
                 "reason": reason,
-                "recommendation": _format_recommendation_history(code, recommendation_lookup, recommendation_error),
+                "recommendation": _format_recommendation_history(code, recommendation_lookup, recommendation_error, exclude_date=today),
             }
         )
 
