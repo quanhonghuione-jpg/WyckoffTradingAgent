@@ -73,17 +73,7 @@ def _fetch_one(
         return (symbol, None, str(e), time.monotonic() - t0)
 
 
-def _fetch_batch_tickflow(
-    symbols: list[str], prefetch_start: str, end_s: str
-) -> tuple[list[pd.DataFrame], int, int, list[str]]:
-    """用 TickFlow batch API 批量拉取，减少 API 调用次数。"""
-    from integrations.tickflow_client import TickFlowClient, normalize_cn_symbol, parse_ohlcv_payload
-
-    api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("TICKFLOW_API_KEY 未配置")
-    client = TickFlowClient(api_key=api_key)
-
+def _tickflow_window(prefetch_start: str, end_s: str) -> tuple[int, int, int, str, str]:
     start_d = datetime.strptime(prefetch_start, "%Y%m%d").date()
     end_d = datetime.strptime(end_s, "%Y%m%d").date()
     cn_tz = timezone(timedelta(hours=8))
@@ -96,11 +86,61 @@ def _fetch_batch_tickflow(
     )
     day_span = (end_d - start_d).days + 1
     count = min(max(day_span * 2 + 16, 64), 5000)
+    return start_ms, end_ms, count, start_d.isoformat(), end_d.isoformat()
 
-    all_frames: list[pd.DataFrame] = []
-    ok, fail = 0, 0
-    fail_samples: list[str] = []
 
+def _frame_from_tickflow_batch(
+    sym: str,
+    raw_df: pd.DataFrame | None,
+    start_iso: str,
+    end_iso: str,
+) -> tuple[pd.DataFrame | None, str | None]:
+    if raw_df is None or raw_df.empty:
+        return None, "no_data_in_batch"
+    out = raw_df[(raw_df["date"] >= start_iso) & (raw_df["date"] <= end_iso)].copy()
+    if out.empty:
+        return None, "empty_in_range"
+    close = pd.to_numeric(out.get("close"), errors="coerce")
+    prev_close = pd.to_numeric(out.get("prev_close"), errors="coerce")
+    prev_ref = prev_close.where(prev_close > 0)
+    if prev_ref.notna().sum() == 0:
+        prev_ref = close.shift(1)
+    pct = (close / prev_ref - 1.0) * 100.0
+    high_s = pd.to_numeric(out.get("high"), errors="coerce")
+    low_s = pd.to_numeric(out.get("low"), errors="coerce")
+    amp = (high_s - low_s) / prev_ref * 100.0
+    result = pd.DataFrame(
+        {
+            "日期": out["date"].values,
+            "开盘": out["open"].values,
+            "最高": out["high"].values,
+            "最低": out["low"].values,
+            "收盘": out["close"].values,
+            "成交量": out["volume"].values,
+            "成交额": out["amount"].values,
+            "涨跌幅": pct.values,
+            "换手率": 0.0,
+            "振幅": amp.values,
+        }
+    )
+    df = normalize_hist_from_fetch(result)
+    if df is None or df.empty:
+        return None, "normalized_empty"
+    df["symbol"] = sym
+    return df, None
+
+
+def _fetch_batch_tickflow(
+    symbols: list[str], prefetch_start: str, end_s: str
+) -> tuple[list[pd.DataFrame], int, int, list[str]]:
+    """用 TickFlow batch API 批量拉取，减少 API 调用次数。"""
+    from integrations.tickflow_client import TickFlowClient, normalize_cn_symbol
+
+    api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("TICKFLOW_API_KEY 未配置")
+    client = TickFlowClient(api_key=api_key)
+    start_ms, end_ms, count, start_iso, end_iso = _tickflow_window(prefetch_start, end_s)
     batch_result = client.get_klines_batch(
         symbols,
         period="1d",
@@ -110,55 +150,18 @@ def _fetch_batch_tickflow(
         adjust="forward",
     )
 
-    start_iso = start_d.isoformat()
-    end_iso = end_d.isoformat()
+    all_frames: list[pd.DataFrame] = []
+    fail_samples: list[str] = []
+    fail = 0
     for sym in symbols:
-        tf_sym = normalize_cn_symbol(sym)
-        raw_df = batch_result.get(tf_sym)
-        if raw_df is None or raw_df.empty:
+        df, error = _frame_from_tickflow_batch(sym, batch_result.get(normalize_cn_symbol(sym)), start_iso, end_iso)
+        if error:
             fail += 1
             if len(fail_samples) < 10:
-                fail_samples.append(f"{sym}: no_data_in_batch")
+                fail_samples.append(f"{sym}: {error}")
             continue
-        out = raw_df[(raw_df["date"] >= start_iso) & (raw_df["date"] <= end_iso)].copy()
-        if out.empty:
-            fail += 1
-            if len(fail_samples) < 10:
-                fail_samples.append(f"{sym}: empty_in_range")
-            continue
-        close = pd.to_numeric(out.get("close"), errors="coerce")
-        prev_close = pd.to_numeric(out.get("prev_close"), errors="coerce")
-        prev_ref = prev_close.where(prev_close > 0)
-        if prev_ref.notna().sum() == 0:
-            prev_ref = close.shift(1)
-        pct = (close / prev_ref - 1.0) * 100.0
-        high_s = pd.to_numeric(out.get("high"), errors="coerce")
-        low_s = pd.to_numeric(out.get("low"), errors="coerce")
-        amp = (high_s - low_s) / prev_ref * 100.0
-        result = pd.DataFrame(
-            {
-                "日期": out["date"].values,
-                "开盘": out["open"].values,
-                "最高": out["high"].values,
-                "最低": out["low"].values,
-                "收盘": out["close"].values,
-                "成交量": out["volume"].values,
-                "成交额": out["amount"].values,
-                "涨跌幅": pct.values,
-                "换手率": 0.0,
-                "振幅": amp.values,
-            }
-        )
-        df = normalize_hist_from_fetch(result)
-        if df is None or df.empty:
-            fail += 1
-            if len(fail_samples) < 10:
-                fail_samples.append(f"{sym}: normalized_empty")
-            continue
-        df["symbol"] = sym
         all_frames.append(df)
-        ok += 1
-
+    ok = len(all_frames)
     return all_frames, ok, fail, fail_samples
 
 
@@ -199,7 +202,7 @@ def main() -> int:
     use_batch = bool(os.getenv("TICKFLOW_API_KEY", "").strip()) and not _tf_disabled
 
     if use_batch:
-        print(f"[snapshot] fetch模式: TickFlow batch API (每批200只，顺序请求避免限流)")
+        print("[snapshot] fetch模式: TickFlow batch API (每批200只，顺序请求避免限流)")
         try:
             all_frames, ok, fail, fail_samples = _fetch_batch_tickflow(symbols, prefetch_start, end_s)
         except Exception as e:

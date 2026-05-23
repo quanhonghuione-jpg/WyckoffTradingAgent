@@ -29,7 +29,6 @@ from textual.widgets.option_list import Option
 
 logger = logging.getLogger(__name__)
 
-
 # ---------------------------------------------------------------------------
 # 禁用 kitty keyboard protocol（与 macOS 中文输入法冲突）
 # CSI-u 序列格式: \x1b[ keycode ; modifiers ; text_codepoints u

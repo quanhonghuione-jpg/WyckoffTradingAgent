@@ -1396,6 +1396,50 @@ def _detect_compression(df: pd.DataFrame, cfg: FunnelConfig) -> float | None:
     return float(current_atr_avg / hist_atr_median) if hist_atr_median > 0 else None
 
 
+def _trend_pullback_peak_idx(close: pd.Series, cfg: FunnelConfig) -> int | None:
+    lookback = cfg.trend_pb_lookback
+    ma = close.rolling(cfg.trend_pb_ma_window).mean()
+    last_ma = ma.iloc[-1]
+    if pd.isna(last_ma):
+        return None
+    ma_prev = ma.iloc[-(lookback + 1)]
+    if pd.isna(ma_prev) or float(last_ma) <= float(ma_prev):
+        return None
+
+    recent = close.tail(lookback + 1)
+    peak = float(recent.max())
+    peak_idx = int(recent.values.argmax())
+    if peak_idx < 1 or peak <= 0:
+        return None
+    trough = float(recent.iloc[peak_idx + 1 : -1].min()) if peak_idx + 1 < len(recent) - 1 else float(recent.iloc[-1])
+    last_close = float(close.iloc[-1])
+    pullback_pct = (peak - min(trough, last_close)) / peak * 100.0
+    if pullback_pct < cfg.trend_pb_min_pullback_pct or pullback_pct > cfg.trend_pb_max_pullback_pct:
+        return None
+    if last_close <= float(close.iloc[-2]):
+        return None
+    return peak_idx
+
+
+def _trend_pullback_vol_threshold(close: pd.Series, cfg: FunnelConfig, market_cap_yi: float) -> float:
+    threshold = cfg.trend_pb_vol_shrink_ratio
+    if market_cap_yi >= 200.0:
+        threshold = min(threshold + 0.15, 0.85)
+    ma50 = close.rolling(50).mean()
+    ma200 = close.rolling(200).mean()
+    if len(ma50) < 200 or pd.isna(ma50.iloc[-1]) or pd.isna(ma200.iloc[-1]):
+        return threshold
+
+    streak = 0
+    for i in range(1, min(len(ma50), 60) + 1):
+        if pd.isna(ma50.iloc[-i]) or pd.isna(ma200.iloc[-i]) or float(ma50.iloc[-i]) <= float(ma200.iloc[-i]):
+            break
+        streak += 1
+    if streak >= 20:
+        threshold = min(threshold + 0.10, 0.90)
+    return threshold
+
+
 def _detect_trend_pullback(
     df: pd.DataFrame,
     cfg: FunnelConfig,
@@ -1412,31 +1456,8 @@ def _detect_trend_pullback(
     if close.isna().all() or volume.isna().all():
         return None
 
-    ma = close.rolling(ma_w).mean()
-    last_ma = ma.iloc[-1]
-    if pd.isna(last_ma):
-        return None
-    ma_prev = ma.iloc[-(lookback + 1)]
-    if pd.isna(ma_prev) or float(last_ma) <= float(ma_prev):
-        return None
-
-    recent = close.tail(lookback + 1)
-    peak = float(recent.max())
-    peak_idx = int(recent.values.argmax())
-    if peak_idx < 1 or peak <= 0:
-        return None
-    # trough 不含最后一天，用于判断企稳
-    trough = float(recent.iloc[peak_idx + 1 : -1].min()) if peak_idx + 1 < len(recent) - 1 else float(recent.iloc[-1])
-    last_close = float(close.iloc[-1])
-    prev_close = float(close.iloc[-2])
-
-    pullback_pct = (peak - min(trough, last_close)) / peak * 100.0
-    if pullback_pct < cfg.trend_pb_min_pullback_pct:
-        return None
-    if pullback_pct > cfg.trend_pb_max_pullback_pct:
-        return None
-    # 企稳确认：当日收盘 > 前一日收盘（止跌反弹）
-    if last_close <= prev_close:
+    peak_idx = _trend_pullback_peak_idx(close, cfg)
+    if peak_idx is None:
         return None
 
     # 缩量确认：回落段（排除峰值日）均量 / 上涨段均量
@@ -1449,22 +1470,7 @@ def _detect_trend_pullback(
     vol_ratio = vol_down / vol_up
 
     # 大市值放宽 + 饥饿模式（趋势持续久无触发）
-    threshold = cfg.trend_pb_vol_shrink_ratio
-    if market_cap_yi >= 200.0:
-        threshold = min(threshold + 0.15, 0.85)
-    # 饥饿模式：MA50>MA200 持续天数越长，阈值越宽松
-    ma50 = close.rolling(50).mean()
-    ma200 = close.rolling(200).mean()
-    if len(ma50) >= 200 and pd.notna(ma50.iloc[-1]) and pd.notna(ma200.iloc[-1]):
-        streak = 0
-        for i in range(1, min(len(ma50), 60) + 1):
-            if pd.notna(ma50.iloc[-i]) and pd.notna(ma200.iloc[-i]) and float(ma50.iloc[-i]) > float(ma200.iloc[-i]):
-                streak += 1
-            else:
-                break
-        if streak >= 20:
-            threshold = min(threshold + 0.10, 0.90)
-
+    threshold = _trend_pullback_vol_threshold(close, cfg, market_cap_yi)
     if vol_ratio > threshold:
         return None
     return float(1.0 - vol_ratio)
