@@ -2007,7 +2007,7 @@ def allocate_ai_candidates(
             score += 3.0 if not is_trend_side else 0.0
 
         if code in sos_hit_set:
-            score += 50.0 if code in other_trigger_set else 30.0
+            score += 50.0 if code in other_trigger_set else 15.0
         if code in spring_hit_set:
             score += 45.0
         if code in lps_hit_set:
