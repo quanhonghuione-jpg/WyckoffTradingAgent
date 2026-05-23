@@ -1,6 +1,6 @@
 # 当前市场回测报告
 
-> 自动生成于 2026-05-23 11:28:19 Asia/Shanghai。本文件由 `scripts/update_backtest_market_report.py` 从 Backtest Grid artifacts 更新。
+> 自动生成于 2026-05-23 14:43:22 Asia/Shanghai。本文件由 `scripts/update_backtest_market_report.py` 从 Backtest Grid artifacts 更新。
 
 ## 执行上下文
 
@@ -12,7 +12,7 @@
 - 股票池: main_chinext (sample=0)
 - 每日候选上限: 2
 - 参数单元: 18 组；正夏普 3 组，非正夏普 15 组
-- GitHub Actions: https://github.com/YoungCan-Wang/WyckoffTradingAgent/actions/runs/26321314758
+- GitHub Actions: https://github.com/YoungCan-Wang/WyckoffTradingAgent/actions/runs/26325168232
 
 ## 本次结论
 
