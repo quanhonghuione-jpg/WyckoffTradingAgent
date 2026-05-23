@@ -9,9 +9,10 @@ import { KlineChart } from '@/components/kline-chart'
 import { MultiStockChart, type ComparisonSeries } from '@/components/multi-stock-chart'
 import { UpgradeNotice } from '@/components/upgrade-notice'
 import { AIDisclaimer } from '@/components/ai-disclaimer'
-import { TICKFLOW_PURCHASE, fetchKlineViaTickFlow, fetchValueSnapshot, getUserDataKeys, isSupportedKlineCode, type FundamentalMetric, type KlineData, type ValueSnapshot } from '@/lib/kline'
+import { TICKFLOW_PURCHASE, fetchKlineViaTickFlow, fetchValueSnapshot, getUserDataKeys, isSupportedKlineCode, type KlineData, type ValueSnapshot } from '@/lib/kline'
 import { avg } from '@/lib/math'
 import { resolveStockQuery } from '@/lib/market-search'
+import { buildValueDigest, buildValueScore, formatValuePercent, metricToneClass, numberTone, reverseNumberTone, signalClass, sourceLabel, valueScoreClass, valueUnavailableText, type ValueScore, type ValueTone, type ValueView } from '@/lib/value-analysis'
 
 interface BattleTarget {
   code: string
@@ -212,23 +213,6 @@ function SingleStockPanel({ stock }: { stock: BattleStock }) {
   )
 }
 
-type ValueView = 'quality' | 'risk'
-type ValueTone = 'good' | 'bad' | 'neutral'
-type Translate = ReturnType<typeof usePreferences>['t']
-
-interface ValueSignal {
-  label: string
-  tone: ValueTone
-}
-
-interface ValueScore {
-  label: string
-  tone: ValueTone
-  score: number
-  strengths: ValueSignal[]
-  risks: ValueSignal[]
-}
-
 function ValueBattlePanel({ stocks }: { stocks: BattleStock[] }) {
   const { t } = usePreferences()
   const [view, setView] = useState<ValueView>('quality')
@@ -293,10 +277,10 @@ function ValueBattleCard({ stock, view }: { stock: BattleStock; view: ValueView 
         <ValueBadge value={value} />
       </div>
       <div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 text-sm">
-        <MetricCell label={t('analysis.valueRoe')} value={formatPercent(metrics.roe)} tone={numberTone(metrics.roe, 10, 0)} />
-        <MetricCell label={t('analysis.valueProfitYoy')} value={formatPercent(metrics.net_income_yoy)} tone={numberTone(metrics.net_income_yoy, 0, -10)} />
-        <MetricCell label={t('analysis.valueGrossMargin')} value={formatPercent(metrics.gross_margin)} tone={numberTone(metrics.gross_margin, 30, 15)} />
-        <MetricCell label={t('analysis.valueDebtRatio')} value={formatPercent(metrics.debt_to_asset_ratio)} tone={reverseNumberTone(metrics.debt_to_asset_ratio, 55, 70)} />
+        <MetricCell label={t('analysis.valueRoe')} value={formatValuePercent(metrics.roe)} tone={numberTone(metrics.roe, 10, 0)} />
+        <MetricCell label={t('analysis.valueProfitYoy')} value={formatValuePercent(metrics.net_income_yoy)} tone={numberTone(metrics.net_income_yoy, 0, -10)} />
+        <MetricCell label={t('analysis.valueGrossMargin')} value={formatValuePercent(metrics.gross_margin)} tone={numberTone(metrics.gross_margin, 30, 15)} />
+        <MetricCell label={t('analysis.valueDebtRatio')} value={formatValuePercent(metrics.debt_to_asset_ratio)} tone={reverseNumberTone(metrics.debt_to_asset_ratio, 55, 70)} />
       </div>
       <div className="mt-3 space-y-2">
         {signals.length > 0 ? signals.slice(0, 3).map((signal) => (
@@ -466,99 +450,6 @@ function buildBattleMessages(stocks: BattleStock[]) {
 function buildStockDigest(stock: BattleStock): string {
   const rows = stock.data.slice(-60).map((row) => [row.date, row.open, row.high, row.low, row.close, Math.round(row.volume)].join(','))
   return [`## ${stock.code} ${stock.name}`, `score=${stock.stats.score.toFixed(2)} ret20=${stock.stats.ret20.toFixed(2)} ret60=${stock.stats.ret60.toFixed(2)} ret120=${stock.stats.ret120.toFixed(2)} drawdown60=${stock.stats.drawdown60.toFixed(2)} volumeRatio=${stock.stats.volumeRatio.toFixed(2)}`, buildValueDigest(stock.valueSnapshot), '```csv', 'date,open,high,low,close,volume', ...rows, '```'].join('\n')
-}
-
-function buildValueDigest(snapshot: ValueSnapshot): string {
-  const metrics = snapshot.metrics
-  if (!metrics) return 'value: 暂无可用价值面指标'
-  return [
-    `valueSource=${sourceLabel(snapshot)} period=${metrics.period_end || metrics.announce_date || 'unknown'}`,
-    `valueMetrics roe=${formatPromptPercent(metrics.roe)} netProfitYoY=${formatPromptPercent(metrics.net_income_yoy)} revenueYoY=${formatPromptPercent(metrics.revenue_yoy)} grossMargin=${formatPromptPercent(metrics.gross_margin)} netMargin=${formatPromptPercent(metrics.net_margin)} debtRatio=${formatPromptPercent(metrics.debt_to_asset_ratio)} cashToRevenue=${formatPromptPercent(metrics.operating_cash_to_revenue)}`,
-  ].join('\n')
-}
-
-function buildValueScore(metrics: FundamentalMetric | null, t?: Translate): ValueScore {
-  const tr = (key: Parameters<Translate>[0], fallback: string) => t ? t(key) : fallback
-  if (!metrics) return { label: tr('analysis.valueNoSource', '暂无'), tone: 'neutral', score: -99, strengths: [], risks: [] }
-  let score = 0
-  const strengths: ValueSignal[] = []
-  const risks: ValueSignal[] = []
-  const addStrength = (condition: boolean, label: string, points = 1) => { if (condition) { strengths.push({ label, tone: 'good' }); score += points } }
-  const addRisk = (condition: boolean, label: string, points = 1) => { if (condition) { risks.push({ label, tone: 'bad' }); score -= points } }
-
-  addStrength((metrics.roe ?? -Infinity) >= 10, tr('analysis.valueSignalRoeStrong', 'ROE 较强'), 2)
-  addRisk((metrics.roe ?? Infinity) < 0, tr('analysis.valueRiskRoeLoss', 'ROE 为负'), 2)
-  addStrength((metrics.net_income_yoy ?? -Infinity) > 0, tr('analysis.valueSignalProfitGrowth', '净利润正增长'))
-  addRisk((metrics.net_income_yoy ?? Infinity) < 0, tr('analysis.valueRiskProfitDrop', '净利润下滑'))
-  addStrength((metrics.revenue_yoy ?? -Infinity) > 0, tr('analysis.valueSignalRevenueGrowth', '营收正增长'))
-  addRisk((metrics.revenue_yoy ?? Infinity) < 0, tr('analysis.valueRiskRevenueDrop', '营收下滑'))
-  addStrength((metrics.gross_margin ?? -Infinity) >= 30, tr('analysis.valueSignalGrossMargin', '毛利率较高'))
-  addRisk((metrics.gross_margin ?? Infinity) < 15, tr('analysis.valueRiskGrossMarginLow', '毛利率偏低'))
-  addStrength((metrics.debt_to_asset_ratio ?? Infinity) <= 55, tr('analysis.valueSignalLowDebt', '杠杆较低'))
-  addRisk((metrics.debt_to_asset_ratio ?? -Infinity) >= 70, tr('analysis.valueRiskHighDebt', '资产负债率偏高'), 2)
-  addStrength((metrics.operating_cash_to_revenue ?? -Infinity) >= 5, tr('analysis.valueSignalCashHealthy', '现金流匹配收入'))
-  addRisk((metrics.operating_cash_to_revenue ?? Infinity) < 0, tr('analysis.valueRiskCashWeak', '经营现金流偏弱'))
-
-  const tone: ValueTone = score >= 3 ? 'good' : score < 0 ? 'bad' : 'neutral'
-  const label = tone === 'good' ? tr('analysis.valueScoreStrong', '稳健') : tone === 'bad' ? tr('analysis.valueScoreWeak', '承压') : tr('analysis.valueScoreNeutral', '中性')
-  return { label, tone, score, strengths, risks }
-}
-
-function sourceLabel(snapshot: ValueSnapshot): string {
-  if (snapshot.source === 'tickflow') return 'TickFlow'
-  if (snapshot.source === 'tushare') return 'Tushare'
-  return '--'
-}
-
-function valueUnavailableText(reason: ValueSnapshot['reason'], t: ReturnType<typeof usePreferences>['t']): string {
-  if (reason === 'unsupported-market') return t('analysis.valueUnsupported')
-  if (reason === 'missing-source') return t('analysis.valueMissingSource')
-  return t('analysis.valueUnavailable')
-}
-
-function formatPercent(value: number | undefined): string {
-  if (!Number.isFinite(value)) return '--'
-  const numeric = value as number
-  const digits = Math.abs(numeric) >= 100 ? 1 : 2
-  return `${numeric.toFixed(digits)}%`
-}
-
-function formatPromptPercent(value: number | undefined): string {
-  return Number.isFinite(value) ? `${(value as number).toFixed(2)}%` : '暂无'
-}
-
-function numberTone(value: number | undefined, goodAt: number, badBelow: number): ValueTone {
-  if (!Number.isFinite(value)) return 'neutral'
-  const numeric = value as number
-  if (numeric >= goodAt) return 'good'
-  if (numeric < badBelow) return 'bad'
-  return 'neutral'
-}
-
-function reverseNumberTone(value: number | undefined, goodAtOrBelow: number, badAtOrAbove: number): ValueTone {
-  if (!Number.isFinite(value)) return 'neutral'
-  const numeric = value as number
-  if (numeric <= goodAtOrBelow) return 'good'
-  if (numeric >= badAtOrAbove) return 'bad'
-  return 'neutral'
-}
-
-function metricToneClass(tone: ValueTone): string {
-  if (tone === 'good') return 'text-down'
-  if (tone === 'bad') return 'text-up'
-  return 'text-foreground'
-}
-
-function valueScoreClass(tone: ValueTone): string {
-  if (tone === 'good') return 'bg-down/10 text-down'
-  if (tone === 'bad') return 'bg-up/10 text-up'
-  return 'bg-muted text-muted-foreground'
-}
-
-function signalClass(tone: ValueTone): string {
-  if (tone === 'good') return 'border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-200'
-  if (tone === 'bad') return 'border-rose-200 bg-rose-50 text-rose-800 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-200'
-  return 'border-border text-muted-foreground'
 }
 
 function normalizeBattleError(err: unknown): string {

@@ -10,9 +10,10 @@ import { KlineChart } from '@/components/kline-chart'
 import { usePreferences } from '@/lib/preferences'
 import { AIDisclaimer } from '@/components/ai-disclaimer'
 import { detectWyckoffAnnotations } from '@/lib/wyckoff-detect'
-import { TICKFLOW_PURCHASE, fetchKline, fetchValueSnapshot, getUserDataKeys, checkWhitelist, isCnSymbol, isSupportedKlineCode, type FundamentalMetric, type KlineData, type ValueSnapshot } from '@/lib/kline'
+import { TICKFLOW_PURCHASE, fetchKline, fetchValueSnapshot, getUserDataKeys, checkWhitelist, isCnSymbol, isSupportedKlineCode, type KlineData, type ValueSnapshot } from '@/lib/kline'
 import { avg } from '@/lib/math'
 import { marketLabel, resolveStockQuery, searchStocks, type StockSearchResult } from '@/lib/market-search'
+import { buildValuePrompt, buildValueScore, formatValuePercent, metricToneClass, numberTone, reverseNumberTone, signalClass, sourceLabel, valueScoreClass, valueUnavailableText, type ValueView } from '@/lib/value-analysis'
 
 interface AnalysisResult {
   report: string
@@ -370,20 +371,11 @@ function KlineSection({ klineData }: { klineData: KlineData[] }) {
   )
 }
 
-type ValueView = 'quality' | 'risk'
-type Translate = ReturnType<typeof usePreferences>['t']
-type SignalTone = 'good' | 'bad' | 'neutral'
-
-interface ValueSignal {
-  label: string
-  tone: SignalTone
-}
-
 function ValueSection({ snapshot }: { snapshot: ValueSnapshot }) {
   const { t } = usePreferences()
   const [view, setView] = useState<ValueView>('quality')
   const metrics = snapshot.metrics
-  const signals = useMemo(() => metrics ? buildValueSignals(metrics, t) : null, [metrics, t])
+  const signals = useMemo(() => metrics ? buildValueScore(metrics, t) : null, [metrics, t])
 
   if (!metrics) {
     return (
@@ -402,12 +394,12 @@ function ValueSection({ snapshot }: { snapshot: ValueSnapshot }) {
 
   const shownSignals = view === 'quality' ? signals?.strengths ?? [] : signals?.risks ?? []
   const metricItems = [
-    { label: t('analysis.valueRoe'), value: formatPercent(metrics.roe), tone: numberTone(metrics.roe, 10, 0) },
-    { label: t('analysis.valueProfitYoy'), value: formatPercent(metrics.net_income_yoy), tone: numberTone(metrics.net_income_yoy, 0, -10) },
-    { label: t('analysis.valueRevenueYoy'), value: formatPercent(metrics.revenue_yoy), tone: numberTone(metrics.revenue_yoy, 0, -10) },
-    { label: t('analysis.valueGrossMargin'), value: formatPercent(metrics.gross_margin), tone: numberTone(metrics.gross_margin, 30, 15) },
-    { label: t('analysis.valueDebtRatio'), value: formatPercent(metrics.debt_to_asset_ratio), tone: reverseNumberTone(metrics.debt_to_asset_ratio, 55, 70) },
-    { label: t('analysis.valueCashRevenue'), value: formatPercent(metrics.operating_cash_to_revenue), tone: numberTone(metrics.operating_cash_to_revenue, 5, 0) },
+    { label: t('analysis.valueRoe'), value: formatValuePercent(metrics.roe), tone: numberTone(metrics.roe, 10, 0) },
+    { label: t('analysis.valueProfitYoy'), value: formatValuePercent(metrics.net_income_yoy), tone: numberTone(metrics.net_income_yoy, 0, -10) },
+    { label: t('analysis.valueRevenueYoy'), value: formatValuePercent(metrics.revenue_yoy), tone: numberTone(metrics.revenue_yoy, 0, -10) },
+    { label: t('analysis.valueGrossMargin'), value: formatValuePercent(metrics.gross_margin), tone: numberTone(metrics.gross_margin, 30, 15) },
+    { label: t('analysis.valueDebtRatio'), value: formatValuePercent(metrics.debt_to_asset_ratio), tone: reverseNumberTone(metrics.debt_to_asset_ratio, 55, 70) },
+    { label: t('analysis.valueCashRevenue'), value: formatValuePercent(metrics.operating_cash_to_revenue), tone: numberTone(metrics.operating_cash_to_revenue, 5, 0) },
   ]
 
   return (
@@ -470,83 +462,6 @@ function ReportSection({ report }: { report: string }) {
       <article className="mt-4 prose prose-sm max-w-none text-foreground"><MarkdownContent content={report} /></article>
     </div>
   )
-}
-
-function buildValueSignals(metrics: FundamentalMetric, t: Translate): { label: string; tone: SignalTone; strengths: ValueSignal[]; risks: ValueSignal[] } {
-  let score = 0
-  const strengths: ValueSignal[] = []
-  const risks: ValueSignal[] = []
-  const addStrength = (condition: boolean, label: string, points = 1) => { if (condition) { strengths.push({ label, tone: 'good' }); score += points } }
-  const addRisk = (condition: boolean, label: string, points = 1) => { if (condition) { risks.push({ label, tone: 'bad' }); score -= points } }
-
-  addStrength((metrics.roe ?? -Infinity) >= 10, t('analysis.valueSignalRoeStrong'), 2)
-  addRisk((metrics.roe ?? Infinity) < 0, t('analysis.valueRiskRoeLoss'), 2)
-  addStrength((metrics.net_income_yoy ?? -Infinity) > 0, t('analysis.valueSignalProfitGrowth'))
-  addRisk((metrics.net_income_yoy ?? Infinity) < 0, t('analysis.valueRiskProfitDrop'))
-  addStrength((metrics.revenue_yoy ?? -Infinity) > 0, t('analysis.valueSignalRevenueGrowth'))
-  addRisk((metrics.revenue_yoy ?? Infinity) < 0, t('analysis.valueRiskRevenueDrop'))
-  addStrength((metrics.gross_margin ?? -Infinity) >= 30, t('analysis.valueSignalGrossMargin'))
-  addRisk((metrics.gross_margin ?? Infinity) < 15, t('analysis.valueRiskGrossMarginLow'))
-  addStrength((metrics.debt_to_asset_ratio ?? Infinity) <= 55, t('analysis.valueSignalLowDebt'))
-  addRisk((metrics.debt_to_asset_ratio ?? -Infinity) >= 70, t('analysis.valueRiskHighDebt'), 2)
-  addStrength((metrics.operating_cash_to_revenue ?? -Infinity) >= 5, t('analysis.valueSignalCashHealthy'))
-  addRisk((metrics.operating_cash_to_revenue ?? Infinity) < 0, t('analysis.valueRiskCashWeak'))
-
-  const tone: SignalTone = score >= 3 ? 'good' : score < 0 ? 'bad' : 'neutral'
-  const label = tone === 'good' ? t('analysis.valueScoreStrong') : tone === 'bad' ? t('analysis.valueScoreWeak') : t('analysis.valueScoreNeutral')
-  return { label, tone, strengths, risks }
-}
-
-function sourceLabel(snapshot: ValueSnapshot): string {
-  const source = snapshot.source === 'tickflow' ? 'TickFlow' : snapshot.source === 'tushare' ? 'Tushare' : '--'
-  return source
-}
-
-function valueUnavailableText(reason: ValueSnapshot['reason'], t: Translate): string {
-  if (reason === 'unsupported-market') return t('analysis.valueUnsupported')
-  if (reason === 'missing-source') return t('analysis.valueMissingSource')
-  return t('analysis.valueUnavailable')
-}
-
-function formatPercent(value: number | undefined): string {
-  if (!Number.isFinite(value)) return '--'
-  const numeric = value as number
-  const digits = Math.abs(numeric) >= 100 ? 1 : 2
-  return `${numeric.toFixed(digits)}%`
-}
-
-function numberTone(value: number | undefined, goodAt: number, badBelow: number): SignalTone {
-  if (!Number.isFinite(value)) return 'neutral'
-  const numeric = value as number
-  if (numeric >= goodAt) return 'good'
-  if (numeric < badBelow) return 'bad'
-  return 'neutral'
-}
-
-function reverseNumberTone(value: number | undefined, goodAtOrBelow: number, badAtOrAbove: number): SignalTone {
-  if (!Number.isFinite(value)) return 'neutral'
-  const numeric = value as number
-  if (numeric <= goodAtOrBelow) return 'good'
-  if (numeric >= badAtOrAbove) return 'bad'
-  return 'neutral'
-}
-
-function metricToneClass(tone: SignalTone): string {
-  if (tone === 'good') return 'text-down'
-  if (tone === 'bad') return 'text-up'
-  return 'text-foreground'
-}
-
-function valueScoreClass(tone: SignalTone): string {
-  if (tone === 'good') return 'bg-down/10 text-down'
-  if (tone === 'bad') return 'bg-up/10 text-up'
-  return 'bg-muted text-muted-foreground'
-}
-
-function signalClass(tone: SignalTone): string {
-  if (tone === 'good') return 'border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-200'
-  if (tone === 'bad') return 'border-rose-200 bg-rose-50 text-rose-800 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-200'
-  return 'border-border text-muted-foreground'
 }
 
 function AnalysisProgressBar({ step }: { step: AnalysisStep }) {
@@ -634,26 +549,6 @@ function buildKlinePayload(data: KlineData[]): string {
     '以下是近320个交易日以内的完整日线OHLCV CSV数据。你必须读取这些数据进行判断，不要声称无法读取日线数据。',
     '```csv', 'date,open,high,low,close,volume', ...csvRows, '```',
   ].join('\n')
-}
-
-function buildValuePrompt(snapshot: ValueSnapshot): string {
-  const metrics = snapshot.metrics
-  if (!metrics) return '价值面摘要：暂无可用基本面指标，本次只基于量价结构分析。'
-  const rows = [
-    `价值面摘要（来源：${sourceLabel(snapshot)}${metrics.period_end ? `，报告期：${metrics.period_end}` : ''}）：`,
-    `ROE=${formatPromptPercent(metrics.roe)}，净利润同比=${formatPromptPercent(metrics.net_income_yoy)}，营收同比=${formatPromptPercent(metrics.revenue_yoy)}`,
-    `毛利率=${formatPromptPercent(metrics.gross_margin)}，净利率=${formatPromptPercent(metrics.net_margin)}，资产负债率=${formatPromptPercent(metrics.debt_to_asset_ratio)}`,
-    `经营现金流/营收=${formatPromptPercent(metrics.operating_cash_to_revenue)}，EPS=${formatPromptNumber(metrics.eps_basic)}，每股净资产=${formatPromptNumber(metrics.bps)}`,
-  ]
-  return rows.join('\n')
-}
-
-function formatPromptPercent(value: number | undefined): string {
-  return Number.isFinite(value) ? `${(value as number).toFixed(2)}%` : '暂无'
-}
-
-function formatPromptNumber(value: number | undefined): string {
-  return Number.isFinite(value) ? (value as number).toFixed(2) : '暂无'
 }
 
 async function callLLM(config: Parameters<typeof streamLLMResponse>[0], code: string, name: string, klinePayload: string, valueSnapshot: ValueSnapshot, signal?: AbortSignal, onDelta?: (chunk: string) => void): Promise<string> {
