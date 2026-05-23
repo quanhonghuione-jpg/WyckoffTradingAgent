@@ -37,6 +37,7 @@ export interface ValueSnapshot {
 }
 
 export const TICKFLOW_PURCHASE = 'https://tickflow.org/auth/register?ref=5N4NKTCPL4'
+type Fetcher = typeof globalThis.fetch
 
 export function normalizeCode(code: string | number): string {
   const raw = String(code || '').trim().toUpperCase()
@@ -243,8 +244,8 @@ function findFinancialRecord(payload: unknown, symbol: string): Record<string, u
   return null
 }
 
-async function tusharePost(token: string, api_name: string, params: Record<string, string>, fields: string) {
-  const resp = await fetch('/api/llm-proxy/', {
+async function tusharePostWithFetch(fetcher: Fetcher, token: string, api_name: string, params: Record<string, string>, fields: string) {
+  const resp = await fetcher('/api/llm-proxy/', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Target-URL': 'https://api.tushare.pro' },
     body: JSON.stringify({ api_name, token, params, fields }),
@@ -253,10 +254,14 @@ async function tusharePost(token: string, api_name: string, params: Record<strin
   return (await resp.json()) as { data?: { fields?: string[]; items?: unknown[][] } }
 }
 
-async function fetchFundamentalsViaTickFlow(code: string, apiKey: string): Promise<FundamentalMetric | null> {
+async function tusharePost(token: string, api_name: string, params: Record<string, string>, fields: string) {
+  return tusharePostWithFetch(globalThis.fetch, token, api_name, params, fields)
+}
+
+async function fetchFundamentalsViaTickFlow(fetcher: Fetcher, code: string, apiKey: string): Promise<FundamentalMetric | null> {
   const symbol = normalizeTickFlowSymbol(code)
   const params = new URLSearchParams({ symbols: symbol, latest: 'true' })
-  const resp = await fetch(`/api/llm-proxy/v1/financials/metrics?${params}`, {
+  const resp = await fetcher(`/api/llm-proxy/v1/financials/metrics?${params}`, {
     headers: { 'x-api-key': apiKey, 'X-Target-URL': 'https://api.tickflow.org' },
   })
   if (!resp.ok) throw tickFlowUpgradeError(resp.status, await readTickFlowError(resp))
@@ -264,10 +269,10 @@ async function fetchFundamentalsViaTickFlow(code: string, apiKey: string): Promi
   return record ? normalizeFinancialRecord(record, symbol) : null
 }
 
-async function fetchFundamentalsViaTushare(code: string, token: string): Promise<FundamentalMetric | null> {
+async function fetchFundamentalsViaTushare(fetcher: Fetcher, code: string, token: string): Promise<FundamentalMetric | null> {
   const tsCode = normalizeTushareCode(code)
   const fields = 'ts_code,end_date,ann_date,eps,bps,cfps,roe,roe_dt,or_yoy,netprofit_yoy,grossprofit_margin,netprofit_margin,debt_to_assets,ocf_to_or,inv_turn'
-  const json = await tusharePost(token, 'fina_indicator', { ts_code: tsCode }, fields)
+  const json = await tusharePostWithFetch(fetcher, token, 'fina_indicator', { ts_code: tsCode }, fields)
   const items = json?.data?.items
   const fieldNames = json?.data?.fields
   if (!Array.isArray(items) || !Array.isArray(fieldNames) || items.length === 0) return null
@@ -276,24 +281,28 @@ async function fetchFundamentalsViaTushare(code: string, token: string): Promise
   return normalizeFinancialRecord(record, tsCode)
 }
 
-export async function fetchValueSnapshot(code: string, keys: { tickflow: string | null; tushare: string | null }): Promise<ValueSnapshot> {
+export async function fetchValueSnapshotWithFetch(fetcher: Fetcher, code: string, keys: { tickflow: string | null; tushare: string | null }): Promise<ValueSnapshot> {
   const symbol = isCnSymbol(code) ? normalizeTickFlowSymbol(code) : code.trim().toUpperCase()
   if (!isCnSymbol(code)) return { symbol, source: 'none', metrics: null, reason: 'unsupported-market' }
   if (!keys.tickflow && !keys.tushare) return { symbol, source: 'none', metrics: null, reason: 'missing-source' }
 
   if (keys.tickflow) {
     try {
-      const metrics = await fetchFundamentalsViaTickFlow(code, keys.tickflow)
+      const metrics = await fetchFundamentalsViaTickFlow(fetcher, code, keys.tickflow)
       if (metrics) return { symbol, source: 'tickflow', metrics }
     } catch { /* fall back to Tushare */ }
   }
   if (keys.tushare) {
     try {
-      const metrics = await fetchFundamentalsViaTushare(code, keys.tushare)
+      const metrics = await fetchFundamentalsViaTushare(fetcher, code, keys.tushare)
       if (metrics) return { symbol, source: 'tushare', metrics }
     } catch { /* fall through */ }
   }
   return { symbol, source: 'none', metrics: null, reason: 'not-found' }
+}
+
+export async function fetchValueSnapshot(code: string, keys: { tickflow: string | null; tushare: string | null }): Promise<ValueSnapshot> {
+  return fetchValueSnapshotWithFetch(globalThis.fetch, code, keys)
 }
 
 export async function fetchKlineViaTushare(code: string, token: string, startDate: string, endDate: string): Promise<KlineData[]> {

@@ -27,7 +27,7 @@ const SYSTEM_PROMPT = `# 角色设定
 5. **尾盘记录** — query_tail_buy：查询尾盘买入记录
 6. **调仓方案** — plan_portfolio_update：生成调仓方案（不直接执行）
 11. **确认执行** — execute_portfolio_update：用户确认后执行调仓方案
-7. **个股诊断** — analyze_stock：对单只股票做威科夫深度诊断（K线+量价+阶段，A股6位/美股AAPL.US/港股00700.HK）
+7. **个股诊断** — analyze_stock：对单只股票做威科夫深度诊断（K线+量价+阶段+价值面校准，A股6位/美股AAPL.US/港股00700.HK；价值面当前优先支持A股）
 8. **漏斗选股** — screen_stocks：查看最新一期漏斗选股结果
 9. **AI 研报** — generate_ai_report：为指定股票生成威科夫深度研报
 10. **策略建议** — generate_strategy_decision：基于持仓+大盘给出操作建议
@@ -50,7 +50,8 @@ const SYSTEM_PROMPT = `# 角色设定
 1. 数据先行：所有分析基于工具返回的真实数据，绝不凭空编造数字。
 2. 语言跟随：用户使用什么语言提问，就用什么语言回复。用 Markdown 格式让信息清晰。
 3. 风险声明：涉及具体操作建议时，附带风险提示。
-4. 调仓两步走：涉及调仓时，先调用 plan_portfolio_update 展示方案，等用户明确说"确认"/"执行"/"好的"后才调用 execute_portfolio_update 执行。绝不跳过确认步骤。`
+4. 技术面为主：价值面只用于质量、风险、置信度和仓位校准，不能替代 K 线事实，也不能因为单个财务指标给出过度确定结论。
+5. 调仓两步走：涉及调仓时，先调用 plan_portfolio_update 展示方案，等用户明确说"确认"/"执行"/"好的"后才调用 execute_portfolio_update 执行。绝不跳过确认步骤。`
 
 export interface LLMConfig {
   api_key: string
@@ -367,7 +368,7 @@ function buildTools(userId: string, config: LLMConfig, reasoningCache: string[])
     }),
 
     analyze_stock: tool({
-      description: '对单只股票做威科夫深度诊断：K线走势、量价关系、均线形态、阶段判断。需要股票代码。',
+      description: '对单只股票做威科夫深度诊断：K线走势、量价关系、均线形态、阶段判断，并在A股可用时加入价值面校准（盈利质量、成长、杠杆、现金流）。需要股票代码。',
       inputSchema: z.object({
         code: z.string().describe('股票代码：A股6位数字；美股/港股使用 TickFlow 标准代码，如 AAPL.US / 00700.HK'),
         name: z.string().nullable().describe('股票名称'),

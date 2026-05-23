@@ -1,6 +1,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import type { generateText as GenerateTextFn } from 'ai'
-import { isCnSymbol, normalizeTickFlowSymbol } from './kline'
+import { fetchValueSnapshotWithFetch, isCnSymbol, normalizeTickFlowSymbol, type ValueSnapshot } from './kline'
+import { buildValuePrompt, buildValueScore } from './value-analysis'
 
 export interface KlineRow {
   date: string
@@ -209,6 +210,24 @@ export async function fetchKlineForAgent(deps: ToolDeps, code: string, keys: { t
     try { const r = await fetchKlineViaTushare(deps, code, keys.tushare, fmt(start), fmt(end)); if (r.length) return r.sort((a, b) => a.date.localeCompare(b.date)) } catch { /* */ }
   }
   return []
+}
+
+export async function fetchValueSnapshotForAgent(deps: ToolDeps, code: string, keys: { tickflow: string | null; tushare: string | null }): Promise<ValueSnapshot> {
+  return fetchValueSnapshotWithFetch(deps.fetch, code, keys)
+}
+
+export function buildValueAgentDigest(snapshot: ValueSnapshot): string {
+  const base = buildValuePrompt(snapshot)
+  const score = buildValueScore(snapshot.metrics)
+  if (!snapshot.metrics) return base
+  const strengths = score.strengths.map((item) => item.label).join('；') || '暂无明显质量加分项'
+  const risks = score.risks.map((item) => item.label).join('；') || '暂无明显价值面风险项'
+  return [
+    base,
+    `价值面评级：${score.label}`,
+    `质量信号：${strengths}`,
+    `风险信号：${risks}`,
+  ].join('\n')
 }
 
 export async function fetchQuotes(
@@ -555,24 +574,29 @@ export async function execAnalyzeStock(
   if (!isCnSymbol(code) && !keys.tickflow) {
     return `无法获取 ${code} ${name || ''} 的K线数据。美股/港股诊断需要先在设置页配置 TickFlow API Key，并使用标准代码（如 AAPL.US / 00700.HK）。`
   }
-  const kline = await fetchKlineForAgent(deps, code, keys, userId)
+  const [kline, valueSnapshot] = await Promise.all([
+    fetchKlineForAgent(deps, code, keys, userId),
+    fetchValueSnapshotForAgent(deps, code, keys).catch((): ValueSnapshot => ({ symbol: code, source: 'none', metrics: null, reason: 'not-found' })),
+  ])
   if (kline.length === 0) {
     return `无法获取 ${code} ${name || ''} 的K线数据。美股/港股请使用 TickFlow 标准代码（如 AAPL.US / 00700.HK）。推荐购买 TickFlow 获取实时行情：https://tickflow.org/auth/register?ref=5N4NKTCPL4`
   }
 
   const digest = buildKlineDigest(kline)
+  const valueDigest = buildValueAgentDigest(valueSnapshot)
   const result = await deps.generateText({
     model: model as Parameters<typeof GenerateTextFn>[0]['model'],
-    system: `你是威科夫分析大师。基于以下K线数据，对 ${code} ${name || ''} 进行深度诊断：
+    system: `你是威科夫分析大师。基于以下K线数据和价值面摘要，对 ${code} ${name || ''} 进行深度诊断。主框架仍是量价与威科夫阶段判断，价值面只作为质量、风险和仓位置信度校准：技术面负责时机，价值面负责是否值得提高/降低结论置信度。
 1. 当前威科夫阶段（积累/上涨/派发/下跌），Phase A-E 定位
 2. 量价关系分析（供需力量对比，近期量比变化）
 3. 均线形态（多头/空头排列，金叉/死叉）
 4. 关键支撑与阻力位
-5. 主力行为判断（是否有吸筹/出货迹象）
-6. 操作建议与风险提示（含建议止损位）
+5. 价值面校准（盈利质量、成长、杠杆、现金流如何影响置信度）
+6. 主力行为判断（是否有吸筹/出货迹象）
+7. 操作建议与风险提示（含建议止损位）
 
 用 Markdown 格式输出，简洁专业。`,
-    prompt: digest,
+    prompt: `${valueDigest}\n\n${digest}`,
   })
 
   return result.text || '分析完成但无输出'
@@ -585,16 +609,20 @@ export async function execGenerateAiReport(
 
   const results: string[] = []
   for (const code of codes.slice(0, 3)) {
-    const kline = await fetchKlineForAgent(deps, code, keys, userId)
+    const [kline, valueSnapshot] = await Promise.all([
+      fetchKlineForAgent(deps, code, keys, userId),
+      fetchValueSnapshotForAgent(deps, code, keys).catch((): ValueSnapshot => ({ symbol: code, source: 'none', metrics: null, reason: 'not-found' })),
+    ])
     if (kline.length === 0) {
       results.push(`## ${code}\n无法获取K线数据。美股/港股请使用 TickFlow 标准代码（如 AAPL.US / 00700.HK）。\n`)
       continue
     }
     const digest = buildKlineDigest(kline)
+    const valueDigest = buildValueAgentDigest(valueSnapshot)
     const result = await deps.generateText({
       model: model as Parameters<typeof GenerateTextFn>[0]['model'],
-      system: `你是威科夫分析大师。为 ${code} 撰写一份简明研报，包含：阶段判断、量价特征、关键价位、操作建议。200字以内。`,
-      prompt: digest,
+      system: `你是威科夫分析大师。为 ${code} 撰写一份简明研报，包含：阶段判断、量价特征、价值面校准、关键价位、操作建议。价值面只校准质量/风险/置信度，不替代技术面。250字以内。`,
+      prompt: `${valueDigest}\n\n${digest}`,
     })
     results.push(`## ${code}\n${result.text || '无输出'}\n`)
   }
