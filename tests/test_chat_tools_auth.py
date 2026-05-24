@@ -3,6 +3,11 @@ from __future__ import annotations
 from agents import chat_tools
 
 
+class DummyToolContext:
+    def __init__(self, state: dict[str, str]):
+        self.state = state
+
+
 def test_user_client_cache_key_uses_token_digest(monkeypatch):
     chat_tools._user_client_cache.clear()
     created: list[tuple[str, str]] = []
@@ -17,7 +22,7 @@ def test_user_client_cache_key_uses_token_digest(monkeypatch):
     monkeypatch.setattr("integrations.supabase_base.create_user_client", fake_create_user_client)
     monkeypatch.setattr("integrations.supabase_base.get_session_tokens", lambda _client: ("", ""))
 
-    ctx = chat_tools.ToolContext(
+    ctx = DummyToolContext(
         {
             "user_id": "user-1",
             "access_token": "same-jwt-prefix-token-a",
@@ -51,7 +56,7 @@ def test_with_auth_retry_retries_tuple_auth_failure(monkeypatch):
     monkeypatch.setattr(chat_tools, "_close_cached_clients", lambda: None)
     monkeypatch.setattr(chat_tools, "_relogin_and_create_client", fake_relogin)
 
-    ctx = chat_tools.ToolContext({"user_id": "user-1", "access_token": "old-access", "refresh_token": "old-refresh"})
+    ctx = DummyToolContext({"user_id": "user-1", "access_token": "old-access", "refresh_token": "old-refresh"})
 
     assert chat_tools._with_auth_retry(ctx, fake_update, client=object()) == (True, "ok")
     assert calls[-1] is new_client
