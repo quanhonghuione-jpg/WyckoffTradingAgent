@@ -460,6 +460,31 @@ def _run_step2_with_etf_metrics(run_step2, webhook: str, preview_only: bool):
     return step2_ok, symbols_info, benchmark_context, step2_details
 
 
+def _efficiency_fallback_model() -> str:
+    api_key = os.getenv("EFFICIENCY_API_KEY", "").strip()
+    model = os.getenv("EFFICIENCY_MODEL", "").strip()
+    base_url = os.getenv("EFFICIENCY_BASE_URL", "").strip()
+    return model if api_key and model and base_url else ""
+
+
+def _missing_llm_config(provider: str, api_key: str, step3_skip_llm: bool, skip_step4: bool) -> list[str]:
+    missing = []
+    step3_can_use_efficiency = provider == "gemini" and bool(_efficiency_fallback_model())
+    if not step3_skip_llm and not api_key and not step3_can_use_efficiency:
+        missing.append(f"{provider.upper()}_API_KEY 或 GEMINI_API_KEY")
+    if not skip_step4 and not api_key:
+        missing.append(f"{provider.upper()}_API_KEY 或 GEMINI_API_KEY")
+    return list(dict.fromkeys(missing))
+
+
+def _log_llm_config(provider: str, llm_base_url: str, base_url_env_key: str, logs_path: str | None) -> None:
+    if provider in OPENAI_COMPATIBLE_BASE_URLS:
+        _log(f"LLM base_url: {llm_base_url or '(empty)'} (env={base_url_env_key})", logs_path)
+    efficiency_model = _efficiency_fallback_model()
+    if provider == "gemini" and efficiency_model:
+        _log(f"Step3 Efficiency 兜底已配置: model={efficiency_model}", logs_path)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="每日定时任务：Wyckoff Funnel → 批量研报")
     parser.add_argument("--dry-run", action="store_true", help="仅校验配置，不执行任务")
@@ -491,12 +516,7 @@ def main() -> int:
         f"daily_job_{datetime.now(TZ).strftime('%Y%m%d_%H%M%S')}.log",
     )
 
-    # Secret 完整性预检
-    missing = []
-    # 仅当需要调用模型时强制要求对应厂商 API Key
-    require_api_key = (not step3_skip_llm) or (not skip_step4)
-    if require_api_key and not api_key:
-        missing.append(f"{provider.upper()}_API_KEY 或 GEMINI_API_KEY")
+    missing = _missing_llm_config(provider, api_key, step3_skip_llm, skip_step4)
     if missing:
         _log(f"配置缺失: {', '.join(missing)}", logs_path)
         return 1
@@ -517,8 +537,7 @@ def main() -> int:
         _notify_skip(skip_msg, webhook, wecom_webhook, dingtalk_webhook)
         return 0
 
-    if provider in OPENAI_COMPATIBLE_BASE_URLS:
-        _log(f"LLM base_url: {llm_base_url or '(empty)'} (env={base_url_env_key})", logs_path)
+    _log_llm_config(provider, llm_base_url, base_url_env_key, logs_path)
 
     # 数据源口径在 integrations/data_source.py 中固定为：
     # tickflow 优先（前复权 qfq），失败按 tushare→akshare→baostock→efinance 回退。

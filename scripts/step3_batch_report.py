@@ -27,7 +27,7 @@ from integrations.data_source import (
     fetch_sector_map,
 )
 from integrations.fetch_a_share_csv import _fetch_hist, _resolve_trading_window
-from integrations.llm_client import call_llm
+from integrations.llm_client import call_llm, get_provider_credentials
 from integrations.rag_veto import (
     get_rag_veto_runtime_status,
     is_rag_veto_enabled,
@@ -306,6 +306,58 @@ def _repair_report_structure(
     except Exception as e:
         print(f"[step3] 结构修复失败: {e}")
         return report
+
+
+def _route_label(provider: str, model: str) -> str:
+    labels = {
+        "gemini": "Gemini",
+        "efficiency": "Efficiency",
+    }
+    return f"{labels.get(provider, provider)}:{model}"
+
+
+def _append_llm_route(
+    routes: list[dict[str, str]],
+    *,
+    provider: str,
+    model: str,
+    api_key: str,
+    base_url: str = "",
+) -> None:
+    provider = str(provider or "").strip().lower()
+    model = str(model or "").strip()
+    api_key = str(api_key or "").strip()
+    base_url = str(base_url or "").strip()
+    if not provider or not model or not api_key:
+        return
+    route_key = (provider, model, base_url)
+    if any((r["provider"], r["model"], r["base_url"]) == route_key for r in routes):
+        return
+    routes.append({"provider": provider, "model": model, "api_key": api_key, "base_url": base_url})
+
+
+def _build_step3_llm_routes(provider: str, model: str, api_key: str, llm_base_url: str) -> list[dict[str, str]]:
+    routes: list[dict[str, str]] = []
+    provider = str(provider or "gemini").strip().lower() or "gemini"
+    _append_llm_route(routes, provider=provider, model=model, api_key=api_key, base_url=llm_base_url)
+    if provider == "gemini" and GEMINI_MODEL_FALLBACK and model != GEMINI_MODEL_FALLBACK:
+        _append_llm_route(
+            routes,
+            provider=provider,
+            model=GEMINI_MODEL_FALLBACK,
+            api_key=api_key,
+            base_url=llm_base_url,
+        )
+    if provider == "gemini":
+        eff_key, eff_model, eff_base_url = get_provider_credentials("efficiency")
+        _append_llm_route(
+            routes,
+            provider="efficiency",
+            model=eff_model,
+            api_key=eff_key,
+            base_url=eff_base_url,
+        )
+    return routes
 
 
 def _build_fallback_sections(selected_df: pd.DataFrame) -> str:
@@ -587,6 +639,67 @@ def _build_compliance_brief(
     )
 
 
+def _try_track_llm_routes(
+    *,
+    track: str,
+    routes: list[dict[str, str]],
+    system_prompt: str,
+    user_message: str,
+) -> tuple[str, str, dict[str, str] | None]:
+    for idx, route in enumerate(routes):
+        route_label = _route_label(route["provider"], route["model"])
+        try:
+            report = call_llm(
+                provider=route["provider"],
+                model=route["model"],
+                api_key=route["api_key"],
+                system_prompt=system_prompt,
+                user_message=user_message,
+                base_url=route["base_url"] or None,
+                timeout=300,
+                max_output_tokens=STEP3_MAX_OUTPUT_TOKENS,
+            )
+            return report, route_label, route
+        except Exception as e:
+            print(f"[step3] {track} 轨模型 {route_label} 失败: {e}")
+            if idx == len(routes) - 1:
+                return "", "", None
+    return "", "", None
+
+
+def _repair_track_report_if_needed(
+    *,
+    track: str,
+    report: str,
+    route: dict[str, str],
+    selected_codes: list[str],
+    selected_df: pd.DataFrame,
+) -> str:
+    if not _has_required_sections(report):
+        print(f"[step3] {track} 轨首版研报缺少可识别分层章节，执行一次结构修复")
+        report = _repair_report_structure(
+            report=report,
+            model=route["model"],
+            api_key=route["api_key"],
+            selected_codes=selected_codes,
+            provider=route["provider"],
+            llm_base_url=route["base_url"],
+        )
+    if not _has_required_sections(report):
+        print(f"[step3] {track} 轨结构修复后仍缺少关键章节，追加系统兜底分层")
+        report = report.rstrip() + "\n\n" + _build_fallback_sections(selected_df)
+    return report
+
+
+def _append_leak_warning(track: str, report: str, selected_codes: list[str]) -> str:
+    input_set = {str(c).strip() for c in selected_codes}
+    leaked = set(re.findall(r"\b(\d{6})\b", report)) - input_set
+    if leaked:
+        print(f"[step3] ⚠ {track} 轨报告中出现非本轨标的: {','.join(sorted(leaked))}")
+        report += f"\n\n> ⚠ 以下代码不在{track}轨输入集中，可能为模型幻觉: {', '.join(sorted(leaked))}"
+    return report
+
+
 def _call_track_report(
     *,
     track: str,
@@ -599,54 +712,28 @@ def _call_track_report(
     provider: str = "gemini",
     llm_base_url: str = "",
 ) -> tuple[bool, str, str]:
-    report = ""
-    used_model = ""
-    models_to_try = [model]
-    if GEMINI_MODEL_FALLBACK and model != GEMINI_MODEL_FALLBACK:
-        models_to_try.append(GEMINI_MODEL_FALLBACK)
+    routes = _build_step3_llm_routes(provider, model, api_key, llm_base_url)
+    if not routes:
+        print(f"[step3] {track} 轨没有可用模型路由，请检查 Gemini 或 Efficiency 配置")
+        return (False, "", "")
 
-    for m in models_to_try:
-        try:
-            report = call_llm(
-                provider=provider,
-                model=m,
-                api_key=api_key,
-                system_prompt=system_prompt,
-                user_message=user_message,
-                base_url=llm_base_url or None,
-                timeout=300,
-                max_output_tokens=STEP3_MAX_OUTPUT_TOKENS,
-            )
-            used_model = m
-            break
-        except Exception as e:
-            print(f"[step3] {track} 轨模型 {m} 失败: {e}")
-            if m == models_to_try[-1]:
-                return (False, "", "")
-
-    if not _has_required_sections(report):
-        print(f"[step3] {track} 轨首版研报缺少可识别分层章节，执行一次结构修复")
-        report = _repair_report_structure(
-            report=report,
-            model=used_model or model,
-            api_key=api_key,
-            selected_codes=selected_codes,
-            provider=provider,
-            llm_base_url=llm_base_url,
-        )
-    if not _has_required_sections(report):
-        print(f"[step3] {track} 轨结构修复后仍缺少关键章节，追加系统兜底分层")
-        report = report.rstrip() + "\n\n" + _build_fallback_sections(selected_df)
-
-    # 校验：检测报告中出现但不属于本轨输入集的股票代码（模型幻觉）
-    input_set = {str(c).strip() for c in selected_codes}
-    mentioned = set(re.findall(r"\b(\d{6})\b", report))
-    leaked = mentioned - input_set
-    if leaked:
-        print(f"[step3] ⚠ {track} 轨报告中出现非本轨标的: {','.join(sorted(leaked))}")
-        report += f"\n\n> ⚠ 以下代码不在{track}轨输入集中，可能为模型幻觉: {', '.join(sorted(leaked))}"
-
-    return (True, report, used_model or model)
+    report, used_model, used_route = _try_track_llm_routes(
+        track=track,
+        routes=routes,
+        system_prompt=system_prompt,
+        user_message=user_message,
+    )
+    if not used_route:
+        return (False, "", "")
+    report = _repair_track_report_if_needed(
+        track=track,
+        report=report,
+        route=used_route,
+        selected_codes=selected_codes,
+        selected_df=selected_df,
+    )
+    report = _append_leak_warning(track, report, selected_codes)
+    return (True, report, used_model or _route_label(provider, model))
 
 
 def _fill_wyckoff_score(df: pd.DataFrame) -> None:
@@ -1021,7 +1108,7 @@ def run(
         if rag_veto_lines:
             report = rag_veto_preview + report + "\n\n## 🛑 RAG 防雷剔除清单\n" + "\n".join(rag_veto_lines)
         if notify:
-            model_banner = f"🤖 模型: {model}"
+            model_banner = f"🤖 模型: {_route_label(provider, model)}"
             content = f"{model_banner}\n\n{report}"
             title = f"📄 批量研报 {date.today().strftime('%Y-%m-%d')}"
             if not _notify_all(title, content):
@@ -1159,7 +1246,7 @@ def run(
         )
         _dump_model_input(
             items=items_by_track.get(track, []),
-            model=model,
+            model=_route_label(provider, model),
             system_prompt=WYCKOFF_FUNNEL_SYSTEM_PROMPT,
             user_message=user_message,
             name_hint=track.lower(),
@@ -1169,7 +1256,7 @@ def run(
         if notify:
             ok, preview_report = _send_input_preview(
                 webhook_url=webhook_url,
-                model=model,
+                model=_route_label(provider, model),
                 system_prompt=WYCKOFF_FUNNEL_SYSTEM_PROMPT,
                 previews=track_requests,
             )
@@ -1179,7 +1266,7 @@ def run(
             preview_blocks: list[str] = [
                 "# 🧪 Step3 模型输入预演（未调用大模型）",
                 "",
-                f"- 目标模型: `{model}`",
+                f"- 目标模型: `{_route_label(provider, model)}`",
                 f"- 输入股票数: `{sum(int(x.get('selected_count', 0) or 0) for x in track_requests)}`",
                 "- 模式: `STEP3_SKIP_LLM=1`",
                 "",
