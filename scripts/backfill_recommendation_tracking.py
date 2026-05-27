@@ -9,6 +9,7 @@ from datetime import UTC, datetime, time
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+from dotenv import load_dotenv
 
 if __name__ == "__main__" or not __package__:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -76,8 +77,10 @@ def _day_bounds_ms(recommend_date: int) -> tuple[int, int]:
 def _close_price(df: pd.DataFrame | None, recommend_date: int) -> float:
     if df is None or df.empty or not {"date", "close"}.issubset(df.columns):
         return 0.0
-    day = datetime.strptime(str(recommend_date), "%Y%m%d").date().isoformat()
-    work = df[df["date"].astype(str) == day].copy()
+    day = datetime.strptime(str(recommend_date), "%Y%m%d").date()
+    work = df.copy()
+    work["date_obj"] = pd.to_datetime(work["date"], errors="coerce").dt.date
+    work = work[work["date_obj"] <= day].sort_values("date_obj")
     if work.empty:
         return 0.0
     close = pd.to_numeric(work["close"], errors="coerce").dropna()
@@ -157,6 +160,7 @@ def run_backfill(preset_name: str, artifacts_dir: str) -> int:
 
 
 def main() -> int:
+    load_dotenv(".env")
     parser = argparse.ArgumentParser(description="Backfill recommendation_tracking from historical report presets.")
     parser.add_argument("--preset", default="20260526-l4", choices=sorted(PRESETS))
     parser.add_argument("--artifacts-dir", default=os.getenv("BACKFILL_ARTIFACTS_DIR", "artifacts"))
