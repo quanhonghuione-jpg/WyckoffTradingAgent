@@ -63,6 +63,10 @@ _LAYER_TYPES = {
     "场景": ("scenario", "L2"),
 }
 
+DEFAULT_MAX_CHARS_PER_MEMORY = 200
+DEFAULT_MAX_TOTAL_RECALL_CHARS = 1200
+_RECALL_TRUNCATION_SUFFIX = "…（已截断，可用 wyckoff memory trace 查看来源）"
+
 
 def extract_stock_codes(text: str) -> list[str]:
     return list(dict.fromkeys(_CODE_RE.findall(text)))
@@ -212,14 +216,94 @@ def refresh_memory_layers(provider: Any) -> int:
     return saved
 
 
-def _memory_line(memory: dict) -> str:
+def _truncate_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    if max_chars <= len(_RECALL_TRUNCATION_SUFFIX):
+        return text[:max_chars]
+    return text[: max_chars - len(_RECALL_TRUNCATION_SUFFIX)].rstrip() + _RECALL_TRUNCATION_SUFFIX
+
+
+def _memory_line(memory: dict, *, max_chars: int = DEFAULT_MAX_CHARS_PER_MEMORY) -> str:
     date_str = str(memory.get("created_at", ""))[:10]
     content = str(memory.get("content", "")).strip()
-    if len(content) > 200:
-        content = content[:200] + "…"
+    content = _truncate_text(content, max_chars)
     source = str(memory.get("source_ref", "")).strip()
     suffix = f" | 源:{source}" if source else ""
     return f"- #{memory.get('id')} [{date_str}] {content}{suffix}"
+
+
+def _budget_recall_lines(lines: list[str], max_total_chars: int) -> list[str]:
+    if max_total_chars <= 0:
+        return lines
+    budgeted: list[str] = []
+    used = 0
+    for line in lines:
+        separator = 1 if budgeted else 0
+        remaining = max_total_chars - used - separator
+        if remaining <= 0:
+            break
+        next_line = _truncate_text(line, remaining) if len(line) > remaining else line
+        budgeted.append(next_line)
+        used += separator + len(next_line)
+        if next_line != line:
+            break
+    return budgeted
+
+
+def _wrap_recall_context(lines: list[str]) -> str:
+    if not lines:
+        return ""
+    body = "\n".join(lines)
+    return (
+        "<relevant-memories>\n"
+        "以下是当前对话召回的相关记忆，不代表当前任务进程，仅作为参考：\n\n"
+        f"{body}\n"
+        "</relevant-memories>"
+    )
+
+
+def prepend_memory_context(user_text: str, memory_context: str) -> str:
+    """Return a current-turn user message with transient recalled memories."""
+
+    if not memory_context.strip():
+        return user_text
+    return f"{memory_context.strip()}\n\n<current-user-message>\n{user_text}\n</current-user-message>"
+
+
+def _append_profile_lines(lines: list[str], personas: list[dict], prefs: list[dict], max_chars: int) -> None:
+    if not personas and not prefs:
+        return
+    lines.append("# 用户画像")
+    for memory in personas + prefs:
+        content = str(memory.get("content", "")).strip()
+        if content:
+            lines.append(f"- {_truncate_text(content, max_chars)}")
+
+
+def _append_scenario_lines(lines: list[str], memories: list[dict], max_chars: int) -> None:
+    scenarios = [m for m in memories if m.get("memory_type") == "scenario"]
+    if not scenarios:
+        return
+    lines.append("# 相关场景")
+    lines.extend(_memory_line(m, max_chars=max_chars) for m in scenarios[:3])
+
+
+def _append_atom_lines(lines: list[str], memories: list[dict], max_chars: int) -> None:
+    atom_types = {"preference", "decision"}
+    atoms = [m for m in memories if m.get("memory_type") in atom_types]
+    if not atoms:
+        return
+    lines.append("# 历史记忆")
+    lines.extend(_memory_line(m, max_chars=max_chars) for m in atoms)
+
+
+def _build_recall_lines(memories: list[dict], personas: list[dict], prefs: list[dict], max_chars: int) -> list[str]:
+    lines: list[str] = []
+    _append_profile_lines(lines, personas, prefs, max_chars)
+    _append_scenario_lines(lines, memories, max_chars)
+    _append_atom_lines(lines, memories, max_chars)
+    return lines
 
 
 def save_session_summary(
@@ -253,7 +337,12 @@ def save_session_summary(
         logger.debug("save session summary failed", exc_info=True)
 
 
-def build_memory_context(user_message: str) -> str:
+def build_memory_context(
+    user_message: str,
+    *,
+    max_chars_per_memory: int = DEFAULT_MAX_CHARS_PER_MEMORY,
+    max_total_chars: int = DEFAULT_MAX_TOTAL_RECALL_CHARS,
+) -> str:
     try:
         from integrations.local_db import (
             get_recent_memories,
@@ -279,27 +368,7 @@ def build_memory_context(user_message: str) -> str:
         if not memories and not prefs and not personas:
             return ""
 
-        lines = [""]
-        if personas or prefs:
-            lines.append("# 用户画像")
-            for p in personas:
-                content = str(p.get("content", "")).strip()
-                if content:
-                    lines.append(f"- {content}")
-            for p in prefs:
-                content = str(p.get("content", "")).strip()
-                if content:
-                    lines.append(f"- {content}")
-
-        scenarios = [m for m in memories if m.get("memory_type") == "scenario"]
-        if scenarios:
-            lines.append("# 相关场景")
-            lines.extend(_memory_line(m) for m in scenarios[:3])
-
-        if memories:
-            lines.append("# 历史记忆")
-            atom_types = {"preference", "decision"}
-            lines.extend(_memory_line(m) for m in memories if m.get("memory_type") in atom_types)
-        return "\n".join(lines)
+        lines = _build_recall_lines(memories, personas, prefs, max_chars_per_memory)
+        return _wrap_recall_context(_budget_recall_lines(lines, max_total_chars))
     except Exception:
         return ""

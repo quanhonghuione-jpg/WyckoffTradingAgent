@@ -741,6 +741,8 @@ def search_memory(
     *,
     codes: list[str] | None = None,
     keyword: str | None = None,
+    memory_level: str | None = None,
+    since: str | None = None,
     limit: int = 10,
 ) -> list[dict]:
     conn = get_db()
@@ -755,6 +757,12 @@ def search_memory(
     if keyword:
         clauses.append("content LIKE ?")
         params.append(f"%{keyword}%")
+    if memory_level:
+        clauses.append("memory_level=?")
+        params.append(memory_level)
+    if since:
+        clauses.append("created_at >= ?")
+        params.append(since)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     cur = conn.execute(
         f"SELECT * FROM agent_memory {where} ORDER BY created_at DESC LIMIT ?",
@@ -763,18 +771,30 @@ def search_memory(
     return [dict(r) for r in cur.fetchall()]
 
 
-def get_recent_memories(*, memory_type: str | None = None, limit: int = 20) -> list[dict]:
+def get_recent_memories(
+    *,
+    memory_type: str | None = None,
+    memory_level: str | None = None,
+    since: str | None = None,
+    limit: int = 20,
+) -> list[dict]:
     conn = get_db()
+    clauses: list[str] = []
+    params: list[Any] = []
     if memory_type:
-        cur = conn.execute(
-            "SELECT * FROM agent_memory WHERE memory_type=? ORDER BY created_at DESC LIMIT ?",
-            (memory_type, limit),
-        )
-    else:
-        cur = conn.execute(
-            "SELECT * FROM agent_memory ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        )
+        clauses.append("memory_type=?")
+        params.append(memory_type)
+    if memory_level:
+        clauses.append("memory_level=?")
+        params.append(memory_level)
+    if since:
+        clauses.append("created_at >= ?")
+        params.append(since)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    cur = conn.execute(
+        f"SELECT * FROM agent_memory {where} ORDER BY created_at DESC LIMIT ?",
+        params + [limit],
+    )
     return [dict(r) for r in cur.fetchall()]
 
 

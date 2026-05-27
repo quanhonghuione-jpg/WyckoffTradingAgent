@@ -789,15 +789,17 @@ class WyckoffTUI(App):
         else:
             log.write(Text.from_markup(f"[bold cyan]❯[/bold cyan] {text}"))
         # 注入记忆上下文
+        mem_ctx = ""
         try:
             from cli.memory import build_memory_context
 
             mem_ctx = build_memory_context(text)
-            if mem_ctx and mem_ctx not in self._system_prompt:
-                self._system_prompt = self._system_prompt.rstrip() + "\n" + mem_ctx
         except Exception:
             logger.debug("memory context injection failed", exc_info=True)
-        self._messages.append({"role": "user", "content": text})
+        user_message = {"role": "user", "content": text}
+        if mem_ctx:
+            user_message["_memory_context"] = mem_ctx
+        self._messages.append(user_message)
         self._start_spinner("thinking")
         self._run_agent()
 
@@ -1542,6 +1544,36 @@ class WyckoffTUI(App):
         except Exception:
             logger.debug("chat log save failed", exc_info=True)
 
+    def _prepare_turn_memory_context(self) -> tuple[int, str]:
+        if not self._messages:
+            return -1, ""
+        turn_index = len(self._messages) - 1
+        user_text = self._messages[turn_index].get("content", "")
+        memory_context = self._messages[turn_index].pop("_memory_context", "")
+        if not memory_context:
+            return turn_index, user_text
+        try:
+            from cli.memory import prepend_memory_context
+
+            self._messages[turn_index]["_raw_content"] = user_text
+            self._messages[turn_index]["content"] = prepend_memory_context(user_text, memory_context)
+        except Exception:
+            logger.debug("memory context prepend failed", exc_info=True)
+        return turn_index, user_text
+
+    def _restore_turn_user_message(self, turn_index: int) -> None:
+        if turn_index < 0 or turn_index >= len(self._messages):
+            return
+        msg = self._messages[turn_index]
+        if msg.get("role") == "user" and msg.get("_raw_content"):
+            msg["content"] = msg.pop("_raw_content")
+
+    def _create_scratchpad(self, user_text: str) -> AgentScratchpad | None:
+        try:
+            return AgentScratchpad(user_text, session_id=self._session_id)
+        except Exception:
+            return None
+
     # ----- Agent 执行（后台 Worker）-----
 
     @work(thread=True, exclusive=True)
@@ -1568,11 +1600,8 @@ class WyckoffTUI(App):
         t_start = time.monotonic()
 
         # 记录用户输入
-        _user_text = self._messages[-1]["content"] if self._messages else ""
-        try:
-            _scratchpad: AgentScratchpad | None = AgentScratchpad(_user_text, session_id=self._session_id)
-        except Exception:
-            _scratchpad = None
+        _turn_user_index, _user_text = self._prepare_turn_memory_context()
+        _scratchpad = self._create_scratchpad(_user_text)
         _model_name = getattr(self._provider, "name", "") if self._provider else ""
         _provider_name = self._state.get("provider_name", "") if self._state else ""
         executed_tool_summaries: list[dict[str, object]] = []
@@ -1845,6 +1874,7 @@ class WyckoffTUI(App):
                     _write(Text.from_markup(f"  [dim]{' · '.join(usage_parts)}[/dim]"))
                     _scroll()
                     self.call_from_thread(self._update_status)
+                    self._restore_turn_user_message(_turn_user_index)
 
                     _chatlog_save("user", _user_text, model=_model_name, provider=_provider_name)
                     _tc_json = (
@@ -1892,6 +1922,7 @@ class WyckoffTUI(App):
                 self._messages.pop()
 
         except Exception as e:
+            self._restore_turn_user_message(_turn_user_index)
             _spinner_stop()
             err = _friendly_error(e)
             if _scratchpad:

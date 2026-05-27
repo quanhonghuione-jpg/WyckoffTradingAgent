@@ -5,6 +5,7 @@ from cli.memory import (
     _save_summary_memories,
     build_memory_context,
     extract_stock_codes,
+    prepend_memory_context,
     save_session_summary,
 )
 
@@ -97,6 +98,43 @@ class TestBuildMemoryContext:
             assert "# 用户画像" in context
             assert "# 历史记忆" in context
             assert "源:chat_log:s1" in context
+        finally:
+            _close_tmp_db(local_db)
+
+    def test_applies_recall_budget_and_tags(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            local_db.save_memory("preference", "偏好" * 80, codes="000001")
+            local_db.save_memory("decision", "决策" * 80, codes="000001")
+
+            context = build_memory_context("000001 怎么处理", max_chars_per_memory=40, max_total_chars=180)
+
+            assert context.startswith("<relevant-memories>")
+            assert context.endswith("</relevant-memories>")
+            assert len(context) < 320
+            assert "已截断" in context
+        finally:
+            _close_tmp_db(local_db)
+
+    def test_prepends_memory_context_to_current_turn_only(self):
+        message = prepend_memory_context("今天怎么看？", "<relevant-memories>\nA\n</relevant-memories>")
+
+        assert message.startswith("<relevant-memories>")
+        assert "<current-user-message>\n今天怎么看？\n</current-user-message>" in message
+
+    def test_local_db_filters_memory_by_level_and_since(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            l1_id = local_db.save_memory("preference", "偏好L1", memory_level="L1")
+            local_db.save_memory("scenario", "场景L2", memory_level="L2")
+
+            l1_rows = local_db.get_recent_memories(memory_level="L1", limit=10)
+            future_rows = local_db.get_recent_memories(since="2999-01-01T00:00:00", limit=10)
+            search_rows = local_db.search_memory(keyword="偏好", memory_level="L1", limit=10)
+
+            assert [r["id"] for r in l1_rows] == [l1_id]
+            assert future_rows == []
+            assert [r["id"] for r in search_rows] == [l1_id]
         finally:
             _close_tmp_db(local_db)
 

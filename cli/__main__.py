@@ -744,7 +744,37 @@ def _memory_id_arg(args) -> str:
     return args.memory_id or args.keyword
 
 
-def _print_memory_list(memories: list[dict]) -> None:
+def _memory_since_arg(value: str) -> str:
+    if not value:
+        return ""
+    from datetime import datetime, timedelta
+
+    raw = value.strip()
+    unit = raw[-1:].lower()
+    if unit in {"d", "h", "m"} and raw[:-1].isdigit():
+        amount = int(raw[:-1])
+        delta = {"d": timedelta(days=amount), "h": timedelta(hours=amount), "m": timedelta(minutes=amount)}[unit]
+        return (datetime.utcnow() - delta).isoformat()
+    return raw
+
+
+def _memory_level_arg(value: str) -> str:
+    level = value.strip().upper()
+    return level if level in {"L1", "L2", "L3"} else ""
+
+
+def _print_memory_rows(memories: list[dict], *, output_format: str = "table") -> None:
+    if output_format == "json":
+        print(json.dumps(memories, ensure_ascii=False, indent=2, default=str))
+        return
+    if output_format == "jsonl":
+        for row in memories:
+            print(json.dumps(row, ensure_ascii=False, default=str))
+        return
+    _print_memory_table(memories)
+
+
+def _print_memory_table(memories: list[dict]) -> None:
     print(f"Agent 记忆 ({len(memories)} 条)")
     print(f"{'ID':>5} {'类型':<12} {'层级':<4} {'日期':<20} {'内容'}")
     print("-" * 80)
@@ -768,37 +798,52 @@ def _delete_memory_by_id(memory_id: str) -> None:
         print(f"✗ 记忆 #{memory_id} 不存在")
 
 
+def _cmd_memory_list(args, level: str, since: str) -> None:
+    from integrations.local_db import get_recent_memories
+
+    mtype = args.type or None
+    memories = get_recent_memories(memory_type=mtype, memory_level=level, since=since, limit=args.limit)
+    if not memories:
+        print("暂无记忆记录")
+        return
+    _print_memory_rows(memories, output_format=args.format)
+
+
+def _cmd_memory_search(args, level: str, since: str) -> None:
+    keyword = args.keyword
+    if not keyword:
+        print("用法: wyckoff memory search <关键词>")
+        sys.exit(1)
+    from integrations.local_db import search_memory
+
+    results = search_memory(keyword=keyword, memory_level=level, since=since, limit=args.limit)
+    if not results:
+        print(f"未找到包含 '{keyword}' 的记忆")
+        return
+    if args.format != "table":
+        _print_memory_rows(results, output_format=args.format)
+        return
+    for m in results:
+        content = m.get("content", "")
+        if len(content) > 80:
+            content = content[:80] + "..."
+        print(f"  [{m['id']}] {m.get('memory_type', '')} | {content}")
+
+
 def _cmd_memory(args):
-    from integrations.local_db import get_recent_memories, init_db, prune_memories
+    from integrations.local_db import init_db, prune_memories
 
     init_db()
     sub = args.memory_cmd or "list"
+    level = _memory_level_arg(args.level)
+    since = _memory_since_arg(args.since)
 
     if sub == "list":
-        mtype = args.type or None
-        memories = get_recent_memories(memory_type=mtype, limit=args.limit)
-        if not memories:
-            print("暂无记忆记录")
-            return
-        _print_memory_list(memories)
+        _cmd_memory_list(args, level, since)
         return
 
     if sub == "search":
-        keyword = args.keyword
-        if not keyword:
-            print("用法: wyckoff memory search <关键词>")
-            sys.exit(1)
-        from integrations.local_db import search_memory
-
-        results = search_memory(keyword=keyword, limit=args.limit)
-        if not results:
-            print(f"未找到包含 '{keyword}' 的记忆")
-            return
-        for m in results:
-            content = m.get("content", "")
-            if len(content) > 80:
-                content = content[:80] + "..."
-            print(f"  [{m['id']}] {m.get('memory_type', '')} | {content}")
+        _cmd_memory_search(args, level, since)
         return
 
     if sub == "clear":
@@ -861,6 +906,9 @@ def _add_memory_parser(sub) -> None:
     p_mem.add_argument(
         "--type", default="", help="过滤类型 (preference/persona/scenario/stock_opinion/decision/market_view)"
     )
+    p_mem.add_argument("--level", default="", help="过滤层级 (L1/L2/L3)")
+    p_mem.add_argument("--since", default="", help="仅显示该时间之后的记忆，支持 ISO 或 7d/24h/30m")
+    p_mem.add_argument("--format", choices=["table", "json", "jsonl"], default="table", help="输出格式")
     p_mem.add_argument("-n", "--limit", type=int, default=20, help="返回条数")
 
 
