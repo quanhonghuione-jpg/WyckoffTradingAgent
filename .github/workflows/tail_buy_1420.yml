@@ -1,6 +1,9 @@
 name: Tail Buy
 
 on:
+  schedule:
+    # 北京时间 周一-周五 14:45（UTC 06:45），A 股收盘前尾盘扫描
+    - cron: "45 6 * * 1-5"
   workflow_dispatch:
 
 concurrency:
