@@ -666,3 +666,100 @@ export async function execStrategyDecision(deps: ToolDeps, userId: string, model
 
   return result.text || '无法生成建议'
 }
+
+
+export async function execIntradayAnalysis(deps: ToolDeps, userId: string, code: string): Promise<string> {
+  const apiKey = await fetchTickFlowKey(deps, userId)
+  if (!apiKey) return '未配置 TickFlow API Key，无法获取分钟线数据。请在设置中配置。'
+  const symbol = normalizeTickFlowSymbol(code)
+  const periods = ['1m', '5m', '15m'] as const
+  const results = await Promise.all(periods.map(async (period) => {
+    const params = new URLSearchParams({ symbol, period, count: period === '1m' ? '500' : '100' })
+    const resp = await deps.fetch(`/api/llm-proxy/v1/klines/intraday?${params}`, {
+      headers: { 'x-api-key': apiKey, 'X-Target-URL': 'https://api.tickflow.org' },
+    })
+    if (!resp.ok) return []
+    return parseTickFlowPayload(await resp.json(), symbol)
+  }))
+  const [rows1m, rows5m, rows15m] = results
+  if (!rows1m || rows1m.length < 10) return `${code} 无法获取分钟线数据，可能非交易时段或代码有误。`
+  const profile = computeIntradayProfile(rows1m, rows5m || [], rows15m || [])
+  const lines = [
+    `📊 ${code} 盘中简评（${rows1m.length}根1m线，仅供参考，权威评分以后端策略为准）`,
+    `VWAP位置: ${profile.vwapPos > 0 ? '上方' : '下方'} ${profile.vwapPos.toFixed(2)}%`,
+    `日内位置: ${(profile.closePos * 100).toFixed(0)}%（0=最低 100=最高）`,
+    `5m趋势: ${profile.trendShort} | 15m趋势: ${profile.trendMid}`,
+    `30m动量: ${profile.momentum30m.toFixed(2)}% | 15m动量: ${profile.momentum15m.toFixed(2)}%`,
+    `量能分布: ${profile.volumeConcentration}`,
+    `参考强度: ${profile.strengthScore.toFixed(0)}/100（简化算法，不含量价深度分析）`,
+  ]
+  return lines.join('\n')
+}
+
+interface IntradayProfileWeb {
+  vwapPos: number; closePos: number
+  trendShort: string; trendMid: string
+  momentum30m: number; momentum15m: number
+  volumeConcentration: string; strengthScore: number
+}
+
+function computeIntradayProfile(rows1m: KlineRow[], rows5m: KlineRow[], rows15m: KlineRow[]): IntradayProfileWeb {
+  const closes1m = rows1m.map(r => r.close)
+  const volumes1m = rows1m.map(r => r.volume)
+  const highs1m = rows1m.map(r => r.high || r.close)
+  const lows1m = rows1m.map(r => r.low || r.close)
+  const last = closes1m[closes1m.length - 1]!
+  const dayHigh = Math.max(...highs1m)
+  const dayLow = Math.min(...lows1m)
+  const dayRange = Math.max(dayHigh - dayLow, 1e-8)
+  const closePos = Math.max(0, Math.min(1, (last - dayLow) / dayRange))
+  const totalAmount = rows1m.reduce((s, r) => s + r.close * r.volume, 0)
+  const totalVol = volumes1m.reduce((s, v) => s + v, 0)
+  const vwap = totalVol > 0 ? totalAmount / totalVol : last
+  const vwapPos = vwap > 0 ? (last / vwap - 1) * 100 : 0
+  const momentum30m = retPct(closes1m, 30)
+  const momentum15m = retPct(closes1m, 15)
+  const trendShort = rows5m.length >= 4 ? computeTrendDir(rows5m) : computeTrendDir(rows1m)
+  const trendMid = rows15m.length >= 4 ? computeTrendDir(rows15m) : 'flat'
+  const mid = (dayHigh + dayLow) / 2
+  const volAbove = rows1m.filter(r => r.close >= mid).reduce((s, r) => s + r.volume, 0)
+  const volTotal = totalVol || 1
+  const ratio = volAbove / volTotal
+  const volumeConcentration = ratio > 0.62 ? '堆量在高位' : ratio < 0.38 ? '堆量在低位' : '均匀分布'
+  const strengthScore = computeStrength(vwapPos, closePos, momentum30m, momentum15m, trendShort, trendMid, volumeConcentration)
+  return { vwapPos, closePos, trendShort, trendMid, momentum30m, momentum15m, volumeConcentration, strengthScore }
+}
+
+function retPct(closes: number[], lookback: number): number {
+  if (closes.length <= lookback) return 0
+  const base = closes[closes.length - 1 - lookback]!
+  const now = closes[closes.length - 1]!
+  return base > 0 ? (now / base - 1) * 100 : 0
+}
+
+function computeTrendDir(rows: KlineRow[]): string {
+  if (rows.length < 4) return 'flat'
+  const closes = rows.slice(-8).map(r => r.close)
+  const n = closes.length
+  const xMean = (n - 1) / 2
+  const yMean = closes.reduce((a, b) => a + b, 0) / n
+  let num = 0, den = 0
+  for (let i = 0; i < n; i++) { num += (i - xMean) * (closes[i]! - yMean); den += (i - xMean) ** 2 }
+  const slope = den > 0 ? num / den : 0
+  const pctSlope = (slope / (yMean || 1)) * 100
+  if (pctSlope > 0.03) return 'up'
+  if (pctSlope < -0.03) return 'down'
+  return 'flat'
+}
+
+function computeStrength(vwap: number, closePos: number, m30: number, m15: number, ts: string, tm: string, vc: string): number {
+  let s = 50
+  s += vwap >= 0.8 ? 12 : vwap >= 0 ? 5 : -8
+  s += closePos >= 0.8 ? 10 : closePos >= 0.6 ? 4 : closePos < 0.35 ? -10 : 0
+  s += m30 >= 0.8 ? 8 : m30 >= 0.3 ? 3 : m30 <= -0.8 ? -8 : 0
+  s += m15 <= -0.5 ? -5 : m15 >= 0.4 ? 3 : 0
+  s += vc === '堆量在高位' ? 5 : vc === '堆量在低位' ? -5 : 0
+  s += ts === 'up' ? 4 : ts === 'down' ? -4 : 0
+  s += tm === 'up' ? 3 : tm === 'down' ? -3 : 0
+  return Math.max(0, Math.min(100, s))
+}

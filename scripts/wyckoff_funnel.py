@@ -202,6 +202,18 @@ except Exception:
     logger.debug("FUNNEL_STRATEGIC_L2_BYPASS_MIN_STOCK_SCORE parse failed, using default", exc_info=True)
     FUNNEL_STRATEGIC_L2_BYPASS_MIN_STOCK_SCORE = 0.55
 
+FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_ENABLED = os.getenv(
+    "FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_ENABLED", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+try:
+    FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_MIN_SCORE = max(
+        float(os.getenv("FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_MIN_SCORE", "55")),
+        0.0,
+    )
+except Exception:
+    logger.debug("FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_MIN_SCORE parse failed, using default", exc_info=True)
+    FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_MIN_SCORE = 55.0
+
 
 def _resolve_funnel_end_calendar_day() -> date:
     """Resolve the funnel end date, allowing replay jobs to pin a historical day."""
@@ -1130,6 +1142,56 @@ def _strategic_stage_reason_map(stage_map: dict[str, str], markup_symbols: list[
     return reasons
 
 
+def _fetch_rescue_klines(seed_codes: list[str]) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+    """为战略旁路候选批量拉取 60m/30m K线。失败时降级为空。"""
+    empty: tuple[dict, dict] = ({}, {})
+    if not FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_ENABLED or not seed_codes:
+        return empty
+    api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
+    if not api_key:
+        return empty
+    try:
+        from integrations.tickflow_client import TickFlowClient, normalize_cn_symbol
+
+        symbols = [normalize_cn_symbol(code) for code in seed_codes]
+        symbols = [s for s in symbols if s]
+        if not symbols:
+            return empty
+        client = TickFlowClient(api_key=api_key)
+        df_60m_map = client.get_klines_batch(symbols, period="60m", count=100)
+        df_30m_map = client.get_klines_batch(symbols, period="30m", count=100)
+        return df_60m_map, df_30m_map
+    except Exception as e:
+        logger.warning("60m/30m rescue klines fetch failed: %s", e)
+        return empty
+
+
+def _rescue_structure_reason_map(
+    seed_codes: list[str],
+    df_60m_map: dict[str, pd.DataFrame],
+    df_30m_map: dict[str, pd.DataFrame] | None = None,
+) -> dict[str, list[str]]:
+    """对有 60m 数据的候选逐只做结构救援分析。"""
+    if not df_60m_map:
+        return {}
+    from core.intraday_analysis import analyze_rescue_structure
+    from integrations.tickflow_client import normalize_cn_symbol
+
+    threshold = FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_MIN_SCORE
+    df_30m_map = df_30m_map or {}
+    result: dict[str, list[str]] = {}
+    for code in seed_codes:
+        sym = normalize_cn_symbol(code)
+        df_60 = df_60m_map.get(sym)
+        if df_60 is None or getattr(df_60, "empty", True):
+            continue
+        df_30 = df_30m_map.get(sym)
+        rescue = analyze_rescue_structure(df_60, df_30)
+        if rescue.rescue_score >= threshold:
+            result[code] = [f"60m结构救援({rescue.rescue_score:.0f}分)", *rescue.rescue_reasons]
+    return result
+
+
 def _build_strategic_l2_bypass(
     seed_codes: list[str],
     df_map: dict[str, pd.DataFrame],
@@ -1138,11 +1200,15 @@ def _build_strategic_l2_bypass(
     market_cap_map: dict[str, float],
 ) -> dict:
     if not seed_codes:
-        return {"pool": [], "triggers": {}, "stage_map": {}, "markup_symbols": [], "reason_map": {}}
+        return {"pool": [], "triggers": {}, "stage_map": {}, "markup_symbols": [], "reason_map": {}, "rescue_map": {}}
     trigger_map = layer4_triggers(seed_codes, df_map, cfg, channel_map=channel_map, market_cap_map=market_cap_map)
     stage_map = detect_accum_stage(seed_codes, df_map, cfg)
     markup_symbols = detect_markup_stage(seed_codes, df_map, cfg)
     reason_map = _strategic_stage_reason_map(stage_map, markup_symbols)
+    df_60m_map, df_30m_map = _fetch_rescue_klines(seed_codes)
+    rescue_reason_map = _rescue_structure_reason_map(seed_codes, df_60m_map, df_30m_map)
+    for code, reasons in rescue_reason_map.items():
+        reason_map.setdefault(code, []).extend(reasons)
     pool = sorted(_trigger_hit_codes(trigger_map) | set(reason_map))
     return {
         "pool": pool,
@@ -1150,6 +1216,7 @@ def _build_strategic_l2_bypass(
         "stage_map": stage_map,
         "markup_symbols": markup_symbols,
         "reason_map": reason_map,
+        "rescue_map": rescue_reason_map,
     }
 
 
@@ -1386,12 +1453,14 @@ def run_funnel_job(
     strategic_l2_bypass_stage_map = strategic_bypass.get("stage_map") or {}
     strategic_l2_bypass_markup_symbols = strategic_bypass.get("markup_symbols") or []
     strategic_l2_bypass_reason_map = strategic_bypass.get("reason_map") or {}
+    strategic_l2_bypass_rescue_map = strategic_bypass.get("rescue_map") or {}
     if strategic_l2_bypass_pool:
         print(
             "[funnel] 战略L2旁路: "
             f"seeds={len(strategic_seed_codes)}, pool={len(strategic_l2_bypass_pool)}, "
             f"L4={len(_trigger_hit_codes(strategic_l2_bypass_triggers))}, "
-            f"stage={len(strategic_l2_bypass_reason_map)}"
+            f"stage={len(strategic_l2_bypass_reason_map)}, "
+            f"rescue={len(strategic_l2_bypass_rescue_map)}"
         )
 
     # Markup 阶段、Accumulation ABC 细化、Exit 信号
@@ -1479,6 +1548,7 @@ def run_funnel_job(
         "strategic_l2_bypass_pool": strategic_l2_bypass_pool,
         "strategic_l2_bypass_triggers": strategic_l2_bypass_triggers,
         "strategic_l2_bypass_stage_map": strategic_l2_bypass_stage_map,
+        "strategic_l2_bypass_rescue_map": strategic_l2_bypass_rescue_map,
         "strategic_l2_bypass_markup_symbols": strategic_l2_bypass_markup_symbols,
         "strategic_l2_bypass_reason_map": strategic_l2_bypass_reason_map,
         # 阶段识别和退出信号

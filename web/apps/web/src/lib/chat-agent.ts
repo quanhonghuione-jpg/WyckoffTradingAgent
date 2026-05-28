@@ -8,7 +8,7 @@ import {
   execSearchStock, execViewPortfolio, execMarketOverview,
   execQueryRecommendations, execQueryTailBuy, execExecutePortfolioUpdate,
   execAnalyzeStock, execScreenStocks, execGenerateAiReport, execStrategyDecision,
-  execMarketHistory,
+  execMarketHistory, execIntradayAnalysis,
 } from './chat-tools'
 
 const SYSTEM_PROMPT = `# 角色设定
@@ -31,6 +31,7 @@ const SYSTEM_PROMPT = `# 角色设定
 8. **漏斗选股** — screen_stocks：查看最新一期漏斗选股结果
 9. **AI 研报** — generate_ai_report：为指定股票生成威科夫深度研报
 10. **策略建议** — generate_strategy_decision：基于持仓+大盘给出操作建议
+13. **盘中分析** — intraday_analysis：获取分钟线多周期数据（1m/5m/15m），返回VWAP位置、趋势、动量、综合强度评分
 
 # 工具路由原则
 
@@ -44,6 +45,7 @@ const SYSTEM_PROMPT = `# 角色设定
 - "帮我选股" / "今天有什么好票" → screen_stocks
 - "帮我出个研报" → generate_ai_report
 - "我该怎么操作" / "给个建议" → generate_strategy_decision
+- "盘中怎么样" / "现在能买吗" / "今天走势如何" → intraday_analysis
 
 # 行为铁律
 
@@ -549,6 +551,12 @@ function buildTools(userId: string, config: LLMConfig, reasoningCache: string[])
       description: '基于当前持仓和市场状态，给出买入/卖出/持有的操作建议。',
       inputSchema: z.object({}),
       execute: () => execStrategyDecision(deps, userId, model),
+    }),
+
+    intraday_analysis: tool({
+      description: '盘中多周期分析：获取分钟线数据，返回VWAP位置、趋势方向、动量、量能分布和综合强度评分。用于判断当前是否适合交易。',
+      inputSchema: z.object({ code: z.string().describe('股票代码：A股6位数字，如 000001') }),
+      execute: ({ code }) => execIntradayAnalysis(deps, userId, code),
     }),
   }
 }
