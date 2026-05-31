@@ -24,6 +24,20 @@ React Web、CLI、MCP 与 GitHub Actions 共同组成当前产品形态；日线
 
 ---
 
+## 知识星球 / 云端共享入口
+
+WyckoffAgent 会始终保持开源，欢迎 fork 自行部署、提交 Issue 和 PR。
+如果你希望免去行情数据源、数据库、云服务器、AI API 和自动化任务的运维成本，可以加入 **「威科夫策略交流学习」知识星球**，共享云端多端同步、每日全市场漏斗推送、自动 AI 研报和专属交流社区。
+
+年费 **CNY 518/年**，折合每天约 **1.4 元**。518 取“我要发”的好彩头；这笔费用主要用于共同平摊系统运维硬成本，不是投资顾问费，也不构成任何收益承诺。
+成本明细与风险边界见 [docs/COST_MODEL.md](docs/COST_MODEL.md)。
+
+<p align="center">
+  <img src="attach/知识星球二维码.jpg" alt="威科夫策略交流学习 知识星球二维码" width="260" />
+</p>
+
+---
+
 ## Operating Cost Transparency
 
 从 **2026-06-03** 起，WyckoffAgent 按付费基础设施运行：行情源、数据库、AI 报告、在线分析服务和自动化维护都会进入显性成本模型。
