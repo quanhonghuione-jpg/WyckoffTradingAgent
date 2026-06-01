@@ -157,6 +157,41 @@ def _write_counted(log_widget, renderable) -> int:
     return max(0, len(log_widget.lines) - before)
 
 
+def _replace_streamed_response(log_widget, strip_count: int, final_text: str) -> int:
+    _pop_lines(log_widget, strip_count)
+    return _write_counted(log_widget, Markdown(final_text))
+
+
+def _display_final_response(
+    log_widget,
+    final_text: str,
+    *,
+    streaming_started: bool,
+    stream_separator_strips: int,
+    stream_text_strips: int,
+    write,
+    call_from_thread,
+) -> bool:
+    if not final_text:
+        return False
+    if streaming_started:
+        strip_count = stream_separator_strips + stream_text_strips
+        call_from_thread(_replace_streamed_response, log_widget, strip_count, final_text)
+    else:
+        write(Text.from_markup("  [dim]───[/dim]"))
+        write(Markdown(final_text))
+    return True
+
+
+def _build_thinking_preview(text: str) -> Text | None:
+    preview = text.strip().replace("\n", " ")
+    if len(preview) > 80:
+        preview = preview[:80] + "…"
+    if not preview:
+        return None
+    return Text.from_markup(f"  [italic magenta]💭 {preview}[/italic magenta]  [dim]({len(text)} 字)[/dim]")
+
+
 class ChatLog(RichLog):
     DEFAULT_CSS = """
     ChatLog {
@@ -1645,15 +1680,6 @@ class WyckoffTUI(App):
                 _stream_separator_strips = 0
                 _streaming_started = False
 
-        def _display_thinking(text: str) -> None:
-            preview = text.strip().replace("\n", " ")
-            if len(preview) > 80:
-                preview = preview[:80] + "…"
-            if preview:
-                _write(
-                    Text.from_markup(f"  [italic magenta]💭 {preview}[/italic magenta]  [dim]({len(text)} 字)[/dim]")
-                )
-
         def _display_tool_result(event: dict[str, Any]) -> None:
             name = event["name"]
             args = event.get("args", {})
@@ -1815,7 +1841,9 @@ class WyckoffTUI(App):
 
                 if event_type == "thinking":
                     _spinner_stop()
-                    _display_thinking(event.get("text", ""))
+                    preview = _build_thinking_preview(event.get("text", ""))
+                    if preview:
+                        _write(preview)
                     continue
                 if event_type == "model_start":
                     _spinner_start("思考中")
@@ -1855,11 +1883,18 @@ class WyckoffTUI(App):
                     final_elapsed = float(event.get("elapsed", time.monotonic() - t_start))
                     final_rounds = int(event.get("rounds", 0))
 
-                    if final_text:
-                        if not _streaming_started:
-                            _write(Text.from_markup("  [dim]───[/dim]"))
-                            _write(Markdown(final_text))
-                            _scroll()
+                    if _display_final_response(
+                        log,
+                        final_text,
+                        streaming_started=_streaming_started,
+                        stream_separator_strips=_stream_separator_strips,
+                        stream_text_strips=_stream_text_strips,
+                        write=_write,
+                        call_from_thread=self.call_from_thread,
+                    ):
+                        _stream_separator_strips = _stream_text_strips = 0
+                        _streaming_started = False
+                        _scroll()
 
                     total_input = final_usage.get("input_tokens", 0)
                     total_output = final_usage.get("output_tokens", 0)
