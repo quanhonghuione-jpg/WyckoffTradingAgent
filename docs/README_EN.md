@@ -85,7 +85,7 @@ Modern React SPA with AI Agent chat, portfolio management, funnel screening, rec
 | Pre-Market Risk | A50 futures + VIX monitoring with four alert levels |
 | Local Dashboard | `wyckoff dashboard` — recommendations, signals, portfolio, agent memory, chat logs; dark/light theme, bilingual CN/EN |
 | Agent Memory | Cross-session memory: auto-extracts session conclusions, injects relevant context on next query |
-| Context Compaction | Dynamic threshold (25% of model context window) auto-compresses long conversations, smart tool result summarization preserves key data |
+| Context Compaction | Remaining-window budget auto-compresses long conversations, smart tool result summarization preserves key data |
 | Tool Confirmation | `exec_command`, `write_file`, `update_portfolio` require user approval before execution |
 | General Agent Capabilities | Execute commands, read/write files, fetch web pages — send a CSV path and it will analyze it |
 | MCP Server | 10 tools exposed via MCP protocol — plug into Claude Code / Cursor / any MCP client |

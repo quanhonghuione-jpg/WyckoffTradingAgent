@@ -1179,14 +1179,9 @@ class WyckoffTUI(App):
             return
         default_cfg = next((c for c in configs if c["id"] == default_id), configs[0])
         if len(configs) == 1:
-            from cli._provider_factory import _create_provider
+            from cli._provider_factory import _create_provider, provider_config_kwargs
 
-            provider, err = _create_provider(
-                default_cfg["provider_name"],
-                default_cfg["api_key"],
-                default_cfg.get("model", ""),
-                default_cfg.get("base_url", ""),
-            )
+            provider, err = _create_provider(**provider_config_kwargs(default_cfg))
             if not err:
                 self._provider = provider
         else:

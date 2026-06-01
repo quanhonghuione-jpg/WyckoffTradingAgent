@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 RuntimeEvent = dict[str, Any]
 
 STREAM_CHUNK_TIMEOUT = 60.0
+_INTERNAL_RETRY_MARKER = "_internal_retry"
 
 
 def _iter_with_timeout(stream, timeout: float, cancel_check: Callable[[], bool] | None = None):
@@ -113,6 +114,10 @@ class RunState:
     recent_args_texts: list[str] = field(default_factory=list)
 
 
+def _drop_internal_retry_messages(messages: list[dict[str, Any]]) -> None:
+    messages[:] = [m for m in messages if not m.get(_INTERNAL_RETRY_MARKER)]
+
+
 def partition_tool_calls(
     tool_calls: list[dict],
     concurrency_safe: Callable[[str], bool],
@@ -161,7 +166,7 @@ class AgentRuntime:
         for round_idx in range(self.max_tool_rounds):
             if round_idx > 0:
                 shrink_stale_tool_results(messages)
-            messages, event = self._compact_if_needed(messages, model_name)
+            messages, event = self._compact_if_needed(messages, model_name, self._provider_context_window())
             if event:
                 yield event
 
@@ -194,9 +199,10 @@ class AgentRuntime:
         self,
         messages: list[dict[str, Any]],
         model_name: str,
+        context_window: int | None,
     ) -> tuple[list[dict[str, Any]], RuntimeEvent | None]:
         prev_len = len(messages)
-        compacted_messages, compacted = compact_messages(messages, self.provider, model_name)
+        compacted_messages, compacted = compact_messages(messages, self.provider, model_name, context_window)
         if not compacted:
             return compacted_messages, None
         messages[:] = compacted_messages
@@ -207,6 +213,13 @@ class AgentRuntime:
             "before_messages": prev_len,
             "after_messages": len(compacted_messages),
         }
+
+    def _provider_context_window(self) -> int | None:
+        try:
+            window = int(getattr(self.provider, "context_window", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        return window if window > 0 else None
 
     def _collect_model_round(
         self,
@@ -326,11 +339,15 @@ class AgentRuntime:
         retry_prompt: str,
     ) -> None:
         if round_state.text:
-            retry_msg: dict[str, Any] = {"role": "assistant", "content": round_state.text}
+            retry_msg: dict[str, Any] = {
+                "role": "assistant",
+                "content": round_state.text,
+                _INTERNAL_RETRY_MARKER: True,
+            }
             if round_state.thinking:
                 retry_msg["reasoning_content"] = round_state.thinking
             messages.append(retry_msg)
-        messages.append({"role": "user", "content": retry_prompt})
+        messages.append({"role": "user", "content": retry_prompt, _INTERNAL_RETRY_MARKER: True})
 
     def _apply_missing_tool_warning(self, round_state: RoundState, state: RunState, expectation: Any) -> None:
         if missing_required_tool(expectation, state.used_tools):
@@ -344,6 +361,7 @@ class AgentRuntime:
         state: RunState,
         rounds: int,
     ) -> RuntimeEvent:
+        _drop_internal_retry_messages(messages)
         final_msg: dict[str, Any] = {"role": "assistant", "content": round_state.text}
         if round_state.thinking:
             final_msg["reasoning_content"] = round_state.thinking

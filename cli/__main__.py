@@ -60,7 +60,7 @@ _logging.basicConfig(level=_logging.CRITICAL)
 # ---------------------------------------------------------------------------
 
 
-from cli._provider_factory import _create_provider  # noqa: F401
+from cli._provider_factory import _create_provider, provider_config_kwargs  # noqa: F401
 
 
 def _get_version() -> str:
@@ -193,13 +193,12 @@ def _cmd_auth(args):
 
 
 def _model_list():
-    from cli.auth import load_default_model_id, load_fallback_model_id, load_light_model_id, load_model_configs
+    from cli.auth import load_default_model_id, load_fallback_model_id, load_model_configs
     from cli.model_registry import format_model_metadata, infer_model_info
 
     configs = load_model_configs()
     default_id = load_default_model_id()
     fallback_id = load_fallback_model_id()
-    light_id = load_light_model_id()
     if not configs:
         print("尚无模型配置，使用 wyckoff model add 添加")
         return
@@ -209,8 +208,6 @@ def _model_list():
             marks += " *"
         if c["id"] == fallback_id:
             marks += " ⚡"
-        if c["id"] == light_id:
-            marks += " 💡"
         metadata = format_model_metadata(infer_model_info(c))
         print(
             f"  {c['id']}{marks}  provider={c.get('provider_name', '')}  "
@@ -219,8 +216,6 @@ def _model_list():
     legend = "  * = 默认"
     if fallback_id:
         legend += "  ⚡ = fallback"
-    if light_id:
-        legend += "  💡 = light 路由"
     print(f"\n{legend}")
 
 
@@ -252,58 +247,29 @@ def _model_add():
     print(f"✓ 模型 {model_id} 已保存")
 
 
-def _model_role_set(args, role: str):
-    """通用 fallback/light 角色设置。"""
-    from cli.auth import load_model_configs
+def _model_fallback_set(args):
+    """设置 fallback 模型。"""
+    from cli.auth import (
+        load_fallback_model_id,
+        load_model_configs,
+        set_fallback_model,
+    )
 
-    if role == "fallback":
-        from cli.auth import load_fallback_model_id as _load
-        from cli.auth import set_fallback_model as _set
-
-        label, empty_msg = "fallback", "未设置（降级到所有模型）"
-    else:
-        from cli.auth import load_light_model_id as _load
-        from cli.auth import set_light_model as _set
-
-        label, empty_msg = "light 路由", "未设置（不启用自动路由）"
-
+    label, empty_msg = "fallback", "未设置（降级到所有模型）"
     model_id = args.model_id
     if not model_id:
-        print(f"当前 {label}: {_load() or empty_msg}")
+        print(f"当前 {label}: {load_fallback_model_id() or empty_msg}")
         return
     if model_id == "none":
-        _set("")
+        set_fallback_model("")
         print(f"✓ 已清除 {label} 设置")
         return
     configs = load_model_configs()
     if not any(c["id"] == model_id for c in configs):
         print(f"✗ 模型 {model_id} 不存在")
         sys.exit(1)
-    _set(model_id)
-    suffix = "（简单问题自动使用此模型）" if role == "light" else ""
-    print(f"✓ {label.capitalize()} 模型已设为 {model_id}{suffix}")
-
-
-def _wrap_routing_provider(state: dict) -> None:
-    """如果配置了 light 模型，用 RoutingProvider 包装当前 provider。"""
-    try:
-        from cli.auth import load_light_model_id, load_model_configs
-
-        light_id = load_light_model_id()
-        if not light_id or not state.get("provider"):
-            return
-        light_cfg = next((c for c in load_model_configs() if c["id"] == light_id), None)
-        if not light_cfg:
-            return
-        light_prov, err = _create_provider(
-            light_cfg["provider_name"], light_cfg["api_key"], light_cfg.get("model", ""), light_cfg.get("base_url", "")
-        )
-        if not err:
-            from cli.model_router import RoutingProvider
-
-            state["provider"] = RoutingProvider(state["provider"], light_prov)
-    except Exception:
-        logger.debug("routing provider setup failed", exc_info=True)
+    set_fallback_model(model_id)
+    print(f"✓ {label.capitalize()} 模型已设为 {model_id}")
 
 
 def _cmd_model(args):
@@ -348,8 +314,8 @@ def _cmd_model(args):
         set_default_model(args.model_id)
         print(f"✓ 默认模型已切换为 {args.model_id}")
         return
-    if sub in ("fallback", "light"):
-        return _model_role_set(args, sub)
+    if sub == "fallback":
+        return _model_fallback_set(args)
     if sub == "cost":
         if not args.model_id:
             print("用法: wyckoff model cost <id> --input-per-1m N --output-per-1m N [--context-window N]")
@@ -398,7 +364,7 @@ def _cmd_model(args):
         return
 
     print(f"未知子命令: {sub}")
-    print("用法: wyckoff model [list|add|set|rm|default|fallback|light|cost|usage]")
+    print("用法: wyckoff model [list|add|set|rm|default|fallback|cost|usage]")
     sys.exit(1)
 
 
@@ -1273,12 +1239,7 @@ def _cmd_tui(_args=None):
                     os.environ.setdefault(ek, cfg["api_key"])
             default_cfg = next((c for c in configs if c["id"] == default_id), configs[0])
             if len(configs) == 1:
-                provider, err = _create_provider(
-                    default_cfg["provider_name"],
-                    default_cfg["api_key"],
-                    default_cfg.get("model", ""),
-                    default_cfg.get("base_url", ""),
-                )
+                provider, err = _create_provider(**provider_config_kwargs(default_cfg))
                 if not err:
                     state.update(default_cfg)
                     state["provider"] = provider
@@ -1290,8 +1251,6 @@ def _cmd_tui(_args=None):
                 state["provider"] = FallbackProvider(configs, default_id, fallback_id=load_fallback_model_id())
     except Exception:
         logger.warning("model provider init failed", exc_info=True)
-
-    _wrap_routing_provider(state)
 
     if state["provider"]:
         tools.set_provider(state["provider"])
@@ -1412,7 +1371,7 @@ def main():
 
     # wyckoff model
     p_model = sub.add_parser("model", help="模型管理")
-    p_model.add_argument("model_cmd", nargs="?", default="list", help="list/add/set/rm/default")
+    p_model.add_argument("model_cmd", nargs="?", default="list", help="list/add/set/rm/default/fallback/cost/usage")
     p_model.add_argument("model_id", nargs="?", default="", help="模型 ID")
     p_model.add_argument("provider", nargs="?", default="", help="供应商 (set 时)")
     p_model.add_argument("api_key", nargs="?", default="", help="API Key (set 时)")

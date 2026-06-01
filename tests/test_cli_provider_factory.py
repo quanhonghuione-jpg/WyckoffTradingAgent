@@ -8,7 +8,9 @@ def test_openai_provider_accepts_minimax_compatible_endpoint():
         "test-key",
         model="MiniMax-M3",
         base_url="https://api.minimaxi.com/v1",
+        context_window=1_000_000,
     )
 
     assert err is None
     assert isinstance(provider, OpenAIProvider)
+    assert provider.context_window == 1_000_000

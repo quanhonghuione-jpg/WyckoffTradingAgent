@@ -85,7 +85,7 @@ SPA moderna con chat de AI Agent, gestion de cartera, screener de embudo, seguim
 | Riesgo pre-mercado | Monitoreo de A50 + VIX con cuatro niveles de alerta |
 | Panel local | `wyckoff dashboard` — recomendaciones, senales, cartera, memoria del agente, logs de chat; tema oscuro/claro, bilingue CN/EN |
 | Memoria del agente | Memoria entre sesiones: extrae conclusiones automaticamente, inyecta contexto relevante en la siguiente consulta |
-| Compresion de contexto | Umbral dinamico (25% de la ventana de contexto del modelo) para compresion automatica, resumen inteligente de resultados de herramientas |
+| Compresion de contexto | Presupuesto de ventana restante para compresion automatica, resumen inteligente de resultados de herramientas |
 | Confirmacion de herramientas | `exec_command`, `write_file`, `update_portfolio` requieren aprobacion del usuario antes de ejecutarse |
 | Capacidades generales del Agent | Ejecutar comandos, leer/escribir archivos, obtener paginas web — envia una ruta CSV y lo analiza |
 | MCP Server | 10 herramientas expuestas via protocolo MCP — compatible con Claude Code / Cursor / cualquier cliente MCP |

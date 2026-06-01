@@ -74,8 +74,9 @@ export interface ModelOption {
 const RETIRED_PROVIDERS = new Set(['zhipu', 'minimax', 'qwen', 'volcengine'])
 const CHAT_STREAM_TIMEOUT_MS = 120_000
 const ALLOWED_URL_RE = /^https?:\/\//i
-const DEFAULT_CONTEXT_WINDOW = 64_000
-const COMPACT_RATIO = 0.25
+const UNKNOWN_MODEL_CONTEXT_WINDOW = 64_000
+const COMPACT_RESERVE_RATIO = 0.25
+const MIN_COMPACT_RESERVE_TOKENS = 16_384
 const TAIL_KEEP = 4
 const DEFAULT_RECENT_KEEP_TOKENS = 20_000
 const MIN_RECENT_KEEP_TOKENS = 4_000
@@ -112,11 +113,19 @@ const MODEL_CONTEXT_WINDOWS: [string, number][] = [
 
 export function getChatContextWindow(modelName: string): number {
   const lower = modelName.toLowerCase()
-  return MODEL_CONTEXT_WINDOWS.find(([prefix]) => lower.includes(prefix))?.[1] ?? DEFAULT_CONTEXT_WINDOW
+  return MODEL_CONTEXT_WINDOWS.find(([prefix]) => lower.includes(prefix))?.[1] ?? UNKNOWN_MODEL_CONTEXT_WINDOW
+}
+
+function getChatCompactReserveTokens(contextWindow: number): number {
+  const window = Math.max(contextWindow, 1)
+  const ratioReserve = Math.floor(window * COMPACT_RESERVE_RATIO)
+  const reserve = Math.max(MIN_COMPACT_RESERVE_TOKENS, ratioReserve)
+  return Math.min(reserve, Math.max(1_000, Math.floor(window / 2)))
 }
 
 export function getChatCompactThreshold(modelName: string): number {
-  return Math.floor(getChatContextWindow(modelName) * COMPACT_RATIO)
+  const window = getChatContextWindow(modelName)
+  return Math.max(1, window - getChatCompactReserveTokens(window))
 }
 
 export function getChatRecentKeepTokens(modelName: string): number {

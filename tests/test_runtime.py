@@ -51,6 +51,23 @@ def test_runtime_emits_tool_events_and_done():
     assert any(m.get("role") == "tool" and m.get("name") == "portfolio" for m in messages)
 
 
+def test_runtime_passes_provider_context_window_to_compaction(monkeypatch):
+    captured: dict[str, int | None] = {}
+
+    def fake_compact_messages(messages, provider, model_name="", context_window=None):
+        captured["context_window"] = context_window
+        return messages, False
+
+    monkeypatch.setattr("cli.runtime.compact_messages", fake_compact_messages)
+    provider = ScriptedProvider(rounds=[[{"type": "text_delta", "text": "ok"}]])
+    provider.context_window = 123_456
+
+    events = list(AgentRuntime(provider, StubToolRegistry()).run_stream([{"role": "user", "content": "hi"}]))
+
+    assert captured["context_window"] == 123_456
+    assert events[-1]["type"] == "done"
+
+
 def test_runtime_emits_retry_event_when_required_tool_is_skipped():
     provider = ScriptedProvider(
         rounds=[

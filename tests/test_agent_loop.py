@@ -68,6 +68,44 @@ def test_resolve_turn_expectation_does_not_hijack_explicit_stock_after_portfolio
     assert expectation is None
 
 
+def test_resolve_turn_expectation_ignores_recalled_memory_in_current_user_message():
+    current = (
+        "<relevant-memories>\n"
+        "- 用户偏好直接按清仓指令处理持仓。\n"
+        "- 家联科技趋势最健康，适合持有。\n"
+        "</relevant-memories>\n\n"
+        "<current-user-message>\n金富科技呢\n</current-user-message>"
+    )
+    messages = [
+        {"role": "user", "content": "我的持仓有什么"},
+        {"role": "assistant", "content": "你当前有 2 只持仓，现金 52,292.28 元。"},
+        {"role": "user", "content": current},
+    ]
+
+    expectation = resolve_turn_expectation(messages)
+
+    assert expectation is None
+
+
+def test_resolve_turn_expectation_uses_raw_current_user_inside_memory_wrapper():
+    current = (
+        "<relevant-memories>\n"
+        "- 用户偏好关注单股走势。\n"
+        "</relevant-memories>\n\n"
+        "<current-user-message>\n做一下体检\n</current-user-message>"
+    )
+    messages = [
+        {"role": "user", "content": "我的持仓有什么"},
+        {"role": "assistant", "content": "你当前有 2 只持仓，现金 52,292.28 元。"},
+        {"role": "user", "content": current},
+    ]
+
+    expectation = resolve_turn_expectation(messages)
+
+    assert expectation is not None
+    assert expectation.required_tool == "portfolio"
+
+
 def test_agent_loop_retries_planning_only_portfolio_turn_until_tool_executes():
     def second_round(messages, tools, system_prompt):
         assert messages[-1]["role"] == "user"
@@ -119,6 +157,8 @@ def test_agent_loop_retries_planning_only_portfolio_turn_until_tool_executes():
     assert len(outcome["provider_calls"]) == 3
     assert outcome["messages"][-1]["role"] == "assistant"
     assert "持仓体检已完成" in outcome["messages"][-1]["content"]
+    assert all("你刚才只给了计划" not in str(m.get("content", "")) for m in outcome["messages"])
+    assert all(not m.get("_internal_retry") for m in outcome["messages"])
 
 
 def test_agent_loop_retries_hallucinated_portfolio_list_until_portfolio_runs():

@@ -99,7 +99,9 @@ def _group_stats(rows: list[dict[str, Any]], group_key: str, horizons: list[int]
 def _score_bucket_stats(rows: list[dict[str, Any]], horizons: list[int]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for horizon in horizons:
-        horizon_rows = [r for r in rows if int(r.get("horizon_days") or 0) == horizon and _num(r.get("priority_score")) is not None]
+        horizon_rows = [
+            r for r in rows if int(r.get("horizon_days") or 0) == horizon and _num(r.get("priority_score")) is not None
+        ]
         scores = sorted(_num(r.get("priority_score")) for r in horizon_rows)
         if not scores:
             result[str(horizon)] = {}
@@ -117,7 +119,17 @@ def _score_bucket_stats(rows: list[dict[str, Any]], horizons: list[int]) -> dict
 def _ranked(rows: list[dict[str, Any]], horizon: int, *, reverse: bool) -> list[dict[str, Any]]:
     picked = [r for r in rows if int(r.get("horizon_days") or 0) == horizon and _num(r.get("return_pct")) is not None]
     ranked = sorted(picked, key=lambda r: _num(r.get("return_pct")) or 0, reverse=reverse)
-    keys = ["trade_date", "code", "name", "signal_type", "track", "regime", "return_pct", "max_drawdown_pct", "priority_score"]
+    keys = [
+        "trade_date",
+        "code",
+        "name",
+        "signal_type",
+        "track",
+        "regime",
+        "return_pct",
+        "max_drawdown_pct",
+        "priority_score",
+    ]
     return [{key: row.get(key) for key in keys} for row in ranked[:20]]
 
 
@@ -166,7 +178,14 @@ def _recommendations(rows: list[dict[str, Any]], horizons: list[int]) -> list[di
             if stats.get("count", 0) < 10:
                 continue
             if stats.get("avg_return_pct", 0) < -3 or stats.get("big_loss_rate_pct", 0) >= 50:
-                recs.append({"type": "downweight", "horizon": horizon, "target": signal, "reason": json.dumps(stats, ensure_ascii=False)})
+                recs.append(
+                    {
+                        "type": "downweight",
+                        "horizon": horizon,
+                        "target": signal,
+                        "reason": json.dumps(stats, ensure_ascii=False),
+                    }
+                )
     return recs
 
 
@@ -174,8 +193,17 @@ def _write_artifacts(report: dict[str, Any], output_dir: str) -> None:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    lines = [f"# 策略归因报告 {report['report_date']}", "", f"- 市场: `{report['market']}`", f"- 窗口: `{report['window_start']}` 至 `{report['window_end']}`"]
-    lines += ["", "## 降权建议", *[f"- `{r['target']}` h={r['horizon']}: {r['reason']}" for r in report["recommendations_json"]]]
+    lines = [
+        f"# 策略归因报告 {report['report_date']}",
+        "",
+        f"- 市场: `{report['market']}`",
+        f"- 窗口: `{report['window_start']}` 至 `{report['window_end']}`",
+    ]
+    lines += [
+        "",
+        "## 降权建议",
+        *[f"- `{r['target']}` h={r['horizon']}: {r['reason']}" for r in report["recommendations_json"]],
+    ]
     (out / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -199,7 +227,12 @@ def main() -> None:
             ).execute()
         if args.output_dir:
             _write_artifacts(report, args.output_dir)
-        print(json.dumps({"market": args.market, "report_date": report["report_date"], "written": not args.no_write}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {"market": args.market, "report_date": report["report_date"], "written": not args.no_write},
+                ensure_ascii=False,
+            )
+        )
     finally:
         close_client(client)
 
