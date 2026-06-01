@@ -13,6 +13,7 @@ import { PreferencesProvider } from '@/lib/preferences'
 
 const PortfolioPage = lazy(() => import('@/routes/portfolio').then(m => ({ default: m.PortfolioPage })))
 const TrackingPage = lazy(() => import('@/routes/tracking').then(m => ({ default: m.TrackingPage })))
+const AttributionPage = lazy(() => import('@/routes/attribution').then(m => ({ default: m.AttributionPage })))
 const SettingsPage = lazy(() => import('@/routes/settings').then(m => ({ default: m.SettingsPage })))
 const AnalysisPage = lazy(() => import('@/routes/analysis').then(m => ({ default: m.AnalysisPage })))
 const StockBattlePage = lazy(() => import('@/routes/stock-battle').then(m => ({ default: m.StockBattlePage })))
@@ -42,6 +43,7 @@ createRoot(document.getElementById('root')!).render(
                   <Route path="/chat" element={<ChatPage />} />
                   <Route path="/portfolio" element={<PortfolioPage />} />
                   <Route path="/tracking" element={<TrackingPage />} />
+                  <Route path="/attribution" element={<AttributionPage />} />
                   <Route path="/analysis" element={<AnalysisPage />} />
                   <Route path="/battle" element={<StockBattlePage />} />
                   <Route path="/history" element={<HistoryPage />} />
