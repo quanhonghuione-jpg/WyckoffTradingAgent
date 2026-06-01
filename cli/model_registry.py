@@ -52,6 +52,7 @@ _MODEL_PATTERNS: tuple[_ModelPattern, ...] = (
     ),
     _ModelPattern(re.compile(r"gpt-4o|gpt-4\.1|gpt-4", re.I), 128_000, False),
     _ModelPattern(re.compile(r"deepseek", re.I), 64_000, True, ("off", "low", "medium", "high")),
+    _ModelPattern(re.compile(r"minimax-m3", re.I), 1_000_000, True, ("off", "adaptive")),
     _ModelPattern(re.compile(r"qwen|kimi|moonshot|minimax|mistral", re.I), 128_000, False),
     _ModelPattern(re.compile(r"longcat|step", re.I), 64_000, False),
 )

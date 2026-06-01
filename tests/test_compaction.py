@@ -28,6 +28,9 @@ class TestGetContextWindow:
     def test_gemini_2(self):
         assert get_context_window("gemini-2.5-flash") == 1_000_000
 
+    def test_minimax_m3(self):
+        assert get_context_window("MiniMax-M3") == 1_000_000
+
     def test_unknown_fallback(self):
         assert get_context_window("some-unknown-model") == 64_000
 

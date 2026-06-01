@@ -24,6 +24,7 @@ _MODEL_CONTEXT_WINDOWS: list[tuple[str, int]] = [
     ("claude-opus", 200_000),
     ("claude-sonnet", 200_000),
     ("claude", 200_000),
+    ("minimax-m3", 1_000_000),
     ("minimax", 128_000),
     ("kimi", 128_000),
     ("qwen", 128_000),
