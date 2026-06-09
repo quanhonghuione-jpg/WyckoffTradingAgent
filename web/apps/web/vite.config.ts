@@ -1,9 +1,14 @@
+import { normalizeGeminiStream } from '../../packages/shared/src/gemini-sse-normalize'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import fs from 'node:fs/promises'
+import { Readable } from 'node:stream'
 import path from 'path'
 import type { Plugin } from 'vite'
+
+const GEMINI_ORIGIN = 'https://generativelanguage.googleapis.com'
+const SSE_CONTENT_RE = /\btext\/event-stream\b/i
 
 const MARKET_DATA_FILES = new Set([
   'stock_list_cache.json',
@@ -68,6 +73,14 @@ function llmProxyPlugin(): Plugin {
           for (const [key, value] of response.headers.entries()) {
             if (key === 'transfer-encoding' || key === 'content-encoding') continue
             res.setHeader(key, value)
+          }
+
+          const contentType = response.headers.get('content-type') || ''
+          const proxyPath = (req.url || '').split('?')[0] || ''
+          const isGeminiChat = targetUrl.startsWith(GEMINI_ORIGIN) && proxyPath.endsWith('/chat/completions')
+          if (isGeminiChat && SSE_CONTENT_RE.test(contentType) && response.body) {
+            Readable.fromWeb(normalizeGeminiStream(response.body)).pipe(res)
+            return
           }
 
           const responseBody = await response.arrayBuffer()
