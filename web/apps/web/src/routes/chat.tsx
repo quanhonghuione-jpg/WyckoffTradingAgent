@@ -1,7 +1,16 @@
 import { useState, useRef, useEffect, useCallback, memo } from 'react'
 import { Send, RotateCcw, ChevronDown, ChevronRight, Wrench, Brain } from 'lucide-react'
 import { useAuthStore } from '@/stores/auth'
-import { loadLLMConfig, loadAllModels, runChatAgentStream, createReasoningCache, type LLMConfig, type ModelOption, type StepInfo } from '@/lib/chat-agent'
+import {
+  loadLLMConfig,
+  loadAllModels,
+  runChatAgentStream,
+  createReasoningCache,
+  createThoughtSignatureCache,
+  type LLMConfig,
+  type ModelOption,
+  type StepInfo,
+} from '@/lib/chat-agent'
 import { MarkdownContent } from '@/components/markdown'
 import { ScreenResultCard } from '@/components/screen-result-card'
 import { AIDisclaimer } from '@/components/ai-disclaimer'
@@ -150,6 +159,7 @@ export function ChatPage() {
   const scrollRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
   const reasoningCacheRef = useRef(createReasoningCache())
+  const thoughtSignatureCacheRef = useRef(createThoughtSignatureCache())
   const pickerRef = useRef<HTMLDivElement>(null)
   const scrollRafRef = useRef(0)
 
@@ -254,6 +264,7 @@ export function ChatPage() {
         },
       },
       reasoningCacheRef.current,
+      thoughtSignatureCacheRef.current,
     )
   }, [input, loading, llmConfig, messages, t, user, scrollToBottom])
 
@@ -261,6 +272,7 @@ export function ChatPage() {
     abortRef.current?.abort()
     abortRef.current = null
     reasoningCacheRef.current = createReasoningCache()
+    thoughtSignatureCacheRef.current = createThoughtSignatureCache()
     setMessages([])
     setLiveSteps([])
     setStreamingText('')

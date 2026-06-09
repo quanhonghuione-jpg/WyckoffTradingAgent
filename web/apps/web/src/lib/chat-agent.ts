@@ -10,6 +10,14 @@ import {
   execAnalyzeStock, execScreenStocks, execGenerateAiReport, execStrategyDecision,
   execMarketHistory, execIntradayAnalysis,
 } from './chat-tools'
+import {
+  captureThoughtSignaturesFromChunk,
+  createThoughtSignatureCache,
+  restoreThoughtSignaturesOnRequest,
+  type ThoughtSignatureCache,
+} from './gemini-thought-signatures'
+
+export { createThoughtSignatureCache, type ThoughtSignatureCache }
 
 const SYSTEM_PROMPT = `# 角色设定
 
@@ -382,7 +390,11 @@ async function throwForApiError(res: Response): Promise<void> {
   throw new Error(msg)
 }
 
-function wrapReasoningStream(res: Response, cache: string[]): Response {
+function wrapReasoningStream(
+  res: Response,
+  reasoningCache: string[],
+  thoughtSignatureCache: ThoughtSignatureCache,
+): Response {
   if (!res.body) return res
   let reasoning = ''
   const decoder = new TextDecoder()
@@ -395,12 +407,13 @@ function wrapReasoningStream(res: Response, cache: string[]): Response {
           if (!line.startsWith('data: ') || line === 'data: [DONE]') continue
           try {
             const evt = JSON.parse(line.slice(6))
+            captureThoughtSignaturesFromChunk(evt, thoughtSignatureCache)
             const rc = evt?.choices?.[0]?.delta?.reasoning_content
             if (rc) reasoning += rc
           } catch {}
         }
       },
-      flush() { if (reasoning) cache.push(reasoning) },
+      flush() { if (reasoning) reasoningCache.push(reasoning) },
     }),
   )
 
@@ -411,30 +424,40 @@ function wrapReasoningStream(res: Response, cache: string[]): Response {
   })
 }
 
-function buildReasoningFetch(cache: string[]): typeof globalThis.fetch {
+function buildProxiedFetch(
+  reasoningCache: string[],
+  thoughtSignatureCache: ThoughtSignatureCache,
+): typeof globalThis.fetch {
   return async (input, init) => {
-    const res = await globalThis.fetch(input, restoreReasoningMessages(init, cache))
+    let patched = restoreThoughtSignaturesOnRequest(init, thoughtSignatureCache)
+    patched = restoreReasoningMessages(patched, reasoningCache)
+    const res = await globalThis.fetch(input, patched)
     await throwForApiError(res)
     const contentType = res.headers.get('content-type') || ''
     if (!contentType.includes('text/event-stream')) return res
-    return wrapReasoningStream(res, cache)
+    return wrapReasoningStream(res, reasoningCache, thoughtSignatureCache)
   }
 }
 
-function createProxiedProvider(config: LLMConfig, reasoningCache: string[]) {
+function createProxiedProvider(
+  config: LLMConfig,
+  reasoningCache: string[],
+  thoughtSignatureCache: ThoughtSignatureCache,
+) {
+  const fetchImpl = buildProxiedFetch(reasoningCache, thoughtSignatureCache)
   if (config.protocol === 'anthropic') {
     return createAnthropic({
       apiKey: config.api_key,
       baseURL: '/api/llm-proxy',
       headers: { 'X-Target-URL': config.base_url },
-      fetch: buildReasoningFetch(reasoningCache),
+      fetch: fetchImpl,
     })
   }
   return createOpenAI({
     apiKey: config.api_key,
     baseURL: '/api/llm-proxy',
     headers: { 'X-Target-URL': config.base_url },
-    fetch: buildReasoningFetch(reasoningCache),
+    fetch: fetchImpl,
   })
 }
 
@@ -468,9 +491,14 @@ function formatPortfolioPlan({ action, code, name, shares, cost_price, stop_loss
   return lines.join('\n')
 }
 
-function buildTools(userId: string, config: LLMConfig, reasoningCache: string[]) {
+function buildTools(
+  userId: string,
+  config: LLMConfig,
+  reasoningCache: string[],
+  thoughtSignatureCache: ThoughtSignatureCache,
+) {
   const deps: ToolDeps = { supabase, fetch: globalThis.fetch, generateText }
-  const model = createProxiedProvider(config, reasoningCache).chat(config.model)
+  const model = createProxiedProvider(config, reasoningCache, thoughtSignatureCache).chat(config.model)
   return {
     search_stock: tool({
       description: '搜索股票，支持代码或名称。返回匹配的股票列表及最新行情。',
@@ -582,10 +610,11 @@ export function runChatAgentStream(
   messages: { role: 'user' | 'assistant'; content: string }[],
   callbacks: StreamCallbacks,
   reasoningCache: string[],
+  thoughtSignatureCache: ThoughtSignatureCache,
 ): AbortController {
-  const provider = createProxiedProvider(config, reasoningCache)
+  const provider = createProxiedProvider(config, reasoningCache, thoughtSignatureCache)
 
-  const tools = buildTools(userId, config, reasoningCache)
+  const tools = buildTools(userId, config, reasoningCache, thoughtSignatureCache)
   const steps: StepInfo[] = []
 
   const abort = new AbortController()
