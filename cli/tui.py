@@ -486,6 +486,66 @@ class ToolConfirmScreen(ModalScreen[dict]):
         self.dismiss({"action": "deny"})
 
 
+class AskUserScreen(ModalScreen[str]):
+    """向用户提问并等待选择或输入的交互弹窗。"""
+
+    DEFAULT_CSS = """
+    AskUserScreen {
+        align: center middle;
+    }
+    #ask-box {
+        width: 64;
+        max-height: 24;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    #ask-question {
+        text-style: bold;
+        margin-bottom: 1;
+        height: auto;
+    }
+    #ask-options {
+        height: auto;
+        max-height: 8;
+        margin-bottom: 1;
+    }
+    #ask-input {
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", show=False)]
+
+    def __init__(self, question: str, options: list[str] | None = None):
+        super().__init__()
+        self.question = question
+        self.options = options or []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ask-box"):
+            yield Static(f"💬 [bold]Agent 提问：[/bold]\n{self.question}", id="ask-question")
+            if self.options:
+                yield OptionList(
+                    *[Option(opt, id=f"opt_{i}") for i, opt in enumerate(self.options)],
+                    id="ask-options",
+                )
+            yield Input(
+                placeholder="在此输入您的回答并按 Enter..." if not self.options else "或者在此处输入自定义回答...",
+                id="ask-input",
+            )
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        selected_option = event.option.prompt
+        self.dismiss(str(selected_option))
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+    def action_cancel(self) -> None:
+        self.dismiss("已取消回答")
+
+
 # ---------------------------------------------------------------------------
 # 错误友好化
 # ---------------------------------------------------------------------------
@@ -577,6 +637,7 @@ class WyckoffTUI(App):
         if self._tools:
             self._tools.set_background_manager(self._bg_manager, self._on_bg_complete)
             self._tools.set_confirm_callback(self._request_tool_confirm)
+            self._tools.set_ask_user_callback(self._request_user_question)
         # 交互式输入状态
         self._input_mode = _InputState.NONE
         self._input_buf: dict[str, str] = {}
@@ -662,6 +723,22 @@ class WyckoffTUI(App):
         self.call_from_thread(_show)
         event.wait(timeout=120)
         return result[0] or {"action": "deny"}
+
+    def _request_user_question(self, question: str, options: list[str] | None = None) -> str:
+        """从 worker 线程调用，阻塞并向用户提问，返回用户的回答。"""
+        event = threading.Event()
+        result: list[str] = [""]
+
+        def _on_dismiss(answer: str) -> None:
+            result[0] = answer
+            event.set()
+
+        def _show() -> None:
+            self.push_screen(AskUserScreen(question, options), _on_dismiss)
+
+        self.call_from_thread(_show)
+        event.wait(timeout=300)  # 等待最长 5 分钟
+        return result[0] or "已超时未作答"
 
     # ----- 快捷键动作 -----
 
@@ -2032,10 +2109,24 @@ class WyckoffTUI(App):
                 Text.from_markup(f"  [green]✅ 后台任务完成：{display}[/green]"),
             )
 
-        summary = json.dumps(result, ensure_ascii=False, default=str)
-        if len(summary) > 3000:
-            summary = summary[:3000] + "..."
-        self._queue.append(f"[后台任务完成] {tool_name}: {summary}")
+        summary_str = json.dumps(result, ensure_ascii=False, default=str)
+        if len(summary_str) > 3000:
+            summary_str = summary_str[:3000] + "..."
+
+        notification = (
+            "[SYSTEM NOTIFICATION - NOT USER INPUT]\n"
+            "This is an automated background-task event, NOT a message from the user.\n"
+            "Do NOT interpret this as user acknowledgement, confirmation, or response to any pending question.\n\n"
+            "<system-reminder>\n"
+            "<task-notification>\n"
+            f"<task-id>{task_id}</task-id>\n"
+            f"<tool-name>{tool_name}</tool-name>\n"
+            f"<status>{'failed' if is_error else 'completed'}</status>\n"
+            f"<summary>{summary_str}</summary>\n"
+            "</task-notification>\n"
+            "</system-reminder>"
+        )
+        self._queue.append(notification)
         # 空闲时自动触发
         if not self._busy:
             self.call_from_thread(self._send_message, self._queue.popleft())

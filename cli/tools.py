@@ -215,6 +215,43 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "ask_user",
+        "description": "向用户提问以获取二次确认、澄清问题或进行交互式单选/多选。在执行高风险/破坏性操作前必须调用此工具。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "向用户提问的问题描述文本（如：'你是否确认要清空调仓记录？'）",
+                },
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "提供给用户的单选项列表（例如：['确认执行', '取消操作']）",
+                },
+            },
+            "required": ["question"],
+        },
+    },
+    {
+        "name": "execute_skill",
+        "description": "执行内置或用户自定义的高级投研技能（如 screen, checkup, report, strategy, backtest 等）。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "技能名称，如 'screen'、'checkup'、'report'、'strategy'、'backtest'",
+                },
+                "user_input": {
+                    "type": "string",
+                    "description": "可选参数。如果技能包含 {user_input} 占位符，将替换为该值",
+                },
+            },
+            "required": ["name"],
+        },
+    },
     # ── 委派工具 ──
     {
         "name": "delegate_to_research",
@@ -333,6 +370,8 @@ TOOL_SPECS: dict[str, ToolSpec] = {
     "read_file": ToolSpec("read_file", "读取文件"),
     "write_file": ToolSpec("write_file", "写入文件", requires_approval=True),
     "web_fetch": ToolSpec("web_fetch", "抓取网页"),
+    "ask_user": ToolSpec("ask_user", "提问用户", concurrency_safe=False),
+    "execute_skill": ToolSpec("execute_skill", "执行技能", concurrency_safe=True),
     "delegate_to_research": ToolSpec("delegate_to_research", "委派研究员"),
     "delegate_to_analysis": ToolSpec("delegate_to_analysis", "委派分析师"),
     "delegate_to_trading": ToolSpec("delegate_to_trading", "委派交易员"),
@@ -358,6 +397,51 @@ def is_concurrency_safe(name: str) -> bool:
     return bool(spec and spec.concurrency_safe)
 
 
+def ask_user(question: str, options: list[str] | None = None, *, tool_context=None) -> dict[str, Any]:
+    """向用户提问并阻塞等待答复。"""
+    registry = getattr(tool_context, "registry", None) if tool_context else None
+    if registry and getattr(registry, "_ask_user_callback", None):
+        try:
+            answer = registry._ask_user_callback(question, options)
+            return {"status": "answered", "answer": answer, "result": f"用户已答复: {answer}"}
+        except Exception as e:
+            logger.error("ask_user_callback failed", exc_info=True)
+            return {"error": f"无法获取用户答复: {e}"}
+
+    # Headless fallback: stdin
+    print(f"\n💬 Agent 提问: {question}")
+    if options:
+        for i, opt in enumerate(options):
+            print(f"  [{i}] {opt}")
+    try:
+        val = input("请输入回答: ").strip()
+        if options and val.isdigit():
+            idx = int(val)
+            if 0 <= idx < len(options):
+                val = options[idx]
+        return {"status": "answered", "answer": val, "result": f"用户已答复: {val}"}
+    except Exception as e:
+        return {"error": f"获取命令行答复失败: {e}"}
+
+
+def execute_skill(name: str, user_input: str = "", *, tool_context=None) -> dict[str, Any]:
+    """执行内置或用户自定义的技能，将技能 prompt 作为结果返回供模型后续消费。"""
+    from cli.skills import load_skills
+
+    skills = load_skills()
+    skill = skills.get(name)
+    if not skill:
+        return {"error": f"未知技能: {name}"}
+
+    prompt = skill.prompt.replace("{user_input}", user_input).strip()
+    return {
+        "status": "success",
+        "skill": name,
+        "instructions": prompt,
+        "message": f"技能 {name} 已成功加载。请严格按照以下 instructions 执行：",
+    }
+
+
 # ---------------------------------------------------------------------------
 # ToolRegistry — 管理工具注册和执行
 # ---------------------------------------------------------------------------
@@ -379,6 +463,7 @@ class ToolRegistry:
         self._bg_manager = None
         self._on_bg_complete = None
         self._confirm_callback = None
+        self._ask_user_callback = None
         self._always_allowed: set[str] = set()
 
     def set_provider(self, provider):
@@ -388,6 +473,10 @@ class ToolRegistry:
     def set_confirm_callback(self, callback):
         """注入确认回调，高风险工具执行前会调用。callback(name, args) -> dict。"""
         self._confirm_callback = callback
+
+    def set_ask_user_callback(self, callback):
+        """注入 ask_user 回调。"""
+        self._ask_user_callback = callback
 
     def set_background_manager(self, bg_manager, on_complete=None):
         from cli.background import BackgroundTaskManager
@@ -437,6 +526,8 @@ class ToolRegistry:
             "query_history": query_history,
             "update_portfolio": update_portfolio,
             "run_backtest": run_backtest,
+            "ask_user": ask_user,
+            "execute_skill": execute_skill,
             "delegate_to_research": delegate_to_research,
             "delegate_to_analysis": delegate_to_analysis,
             "delegate_to_trading": delegate_to_trading,
@@ -450,7 +541,21 @@ class ToolRegistry:
         """返回所有工具的 JSON Schema。"""
         return TOOL_SCHEMAS
 
-    def execute(self, name: str, args: dict[str, Any]) -> Any:
+    def _check_user_confirmed_in_history(self, messages: list[dict[str, Any]] | None) -> bool:
+        if not messages:
+            return False
+        for m in reversed(messages):
+            if m.get("role") == "tool" and m.get("name") == "ask_user":
+                content = m.get("content", "")
+                lower_content = content.lower()
+                if any(
+                    word in lower_content
+                    for word in ("确认", "允许", "继续", "执行", "yes", "ok", "allow", "confirm", "opt_0")
+                ):
+                    return True
+        return False
+
+    def execute(self, name: str, args: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Any:
         """执行指定工具，返回结果。长任务自动提交后台。"""
         # check_background_tasks 直接返回状态
         if name == "check_background_tasks":
@@ -463,15 +568,25 @@ class ToolRegistry:
             return {"error": f"未知工具: {name}"}
 
         # 高风险工具确认
-        if self.requires_approval(name) and self._confirm_callback and name not in self._always_allowed:
-            confirm = self._confirm_callback(name, args)
-            action = confirm.get("action", "deny")
-            if action == "deny":
-                return {"error": "用户拒绝执行此操作"}
-            if action == "always":
-                self._always_allowed.add(name)
-            if action == "edit":
-                args = confirm.get("modified_args", args)
+        if self.requires_approval(name) and name not in self._always_allowed:
+            if not self._check_user_confirmed_in_history(messages):
+                if self._confirm_callback:
+                    confirm = self._confirm_callback(name, args)
+                    action = confirm.get("action", "deny")
+                    if action == "deny":
+                        return {"error": "用户拒绝执行此操作"}
+                    if action == "always":
+                        self._always_allowed.add(name)
+                    if action == "edit":
+                        args = confirm.get("modified_args", args)
+                else:
+                    return {
+                        "error": (
+                            f"操作 [{name}] 具有高风险或破坏性参数，已被拦截。 "
+                            "你必须先调用 `ask_user` 工具向用户解释其风险并获取显式确认（如单选选项或回复“确认”），"
+                            "在用户确认后你才可以再次提交此操作。"
+                        )
+                    }
 
         # 用副本注入 tool_context，避免污染原始 args（会被序列化进 messages）
         call_args = dict(args)

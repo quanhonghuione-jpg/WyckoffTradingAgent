@@ -91,7 +91,7 @@ class StubToolRegistry:
     def schemas(self) -> list[dict[str, Any]]:
         return deepcopy(self._schemas)
 
-    def execute(self, name: str, args: dict[str, Any]) -> Any:
+    def execute(self, name: str, args: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Any:
         self.calls.append({"name": name, "args": deepcopy(args)})
         result = self._tool_results.get(name, {"ok": True, "name": name, "args": deepcopy(args)})
         if callable(result):

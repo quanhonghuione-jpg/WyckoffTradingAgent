@@ -159,6 +159,24 @@ class AgentRuntime:
     ) -> Iterator[RuntimeEvent]:
         """Run the agent loop and yield normalized runtime events."""
 
+        from cli.skills import load_skills
+
+        try:
+            skills = load_skills()
+            if skills:
+                skills_text = "\n".join(f"- {s.name}: {s.description}" for s in skills.values())
+                skills_block = (
+                    "\n\n<system-reminder>\n"
+                    "The following skills are available for use with the execute_skill tool:\n\n"
+                    f"{skills_text}\n\n"
+                    "When a skill matches the user's intent, you should call the execute_skill tool first "
+                    "to retrieve the detailed instructions, and then follow them to accomplish the task.\n"
+                    "</system-reminder>"
+                )
+                system_prompt = system_prompt + skills_block
+        except Exception:
+            logger.debug("Failed to load/inject skills into system prompt", exc_info=True)
+
         state = RunState(started_at=time.monotonic())
         expectation = resolve_turn_expectation(messages)
         model_name = getattr(self.provider, "name", "")
@@ -402,7 +420,7 @@ class AgentRuntime:
             yield self._tool_start_event(call, concurrent=True)
 
         with ThreadPoolExecutor(max_workers=min(len(calls), 5)) as pool:
-            futures = {pool.submit(self._execute_tool_call_raw, c): c for c in calls}
+            futures = {pool.submit(self._execute_tool_call_raw, c, messages): c for c in calls}
             for future in as_completed(futures):
                 call = futures[future]
                 name = call["name"]
@@ -473,7 +491,7 @@ class AgentRuntime:
             return "doom"
 
         yield self._tool_start_event(call)
-        raw = self._execute_tool_call_raw(call)
+        raw = self._execute_tool_call_raw(call, messages)
         yield from self._append_tool_result(
             messages,
             name,
@@ -497,11 +515,13 @@ class AgentRuntime:
             event["concurrent"] = True
         return event
 
-    def _execute_tool_call_raw(self, call: dict[str, Any]) -> dict[str, Any]:
+    def _execute_tool_call_raw(
+        self, call: dict[str, Any], messages: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
         t_tool = time.monotonic()
         status = "ok"
         try:
-            result = self.tools.execute(call["name"], call["args"])
+            result = self.tools.execute(call["name"], call["args"], messages=messages)
             if isinstance(result, dict) and result.get("error"):
                 status = "error"
         except Exception as exc:
