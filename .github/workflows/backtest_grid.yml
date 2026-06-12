@@ -388,6 +388,15 @@ jobs:
                       except ValueError: return None
               return None
 
+          def extract_exact(content, label):
+              prefix = f'- {label}:'
+              for line in content.split('\n'):
+                  if line.strip().startswith(prefix):
+                      val = line.split(':', 1)[-1].strip().rstrip('%')
+                      try: return float(val)
+                      except ValueError: return None
+              return None
+
           cells = []
           for sf in summaries:
               dirname = os.path.basename(os.path.dirname(sf))
@@ -410,6 +419,10 @@ jobs:
                   'mdd': extract(content, '最大回撤'),
                   'trades': extract(content, '成交样本'),
                   'calmar': extract(content, '卡玛比'),
+                  'cash_initial': extract_exact(content, '初始现金'),
+                  'cash_final': extract_exact(content, '最终现金'),
+                  'cash_return': extract_exact(content, '总收益'),
+                  'cash_trades': extract_exact(content, '成交笔数'),
               })
 
           def fmt(v, spec):
@@ -492,6 +505,11 @@ jobs:
 
                   elements.append({'tag': 'div', 'text': {'tag': 'lark_md',
                       'content': f'**策略体检**: {risk_comment(best)}  ·  正夏普组合 {pos_cnt} / 负夏普组合 {neg_cnt}'}})
+                  cash_pnl = None
+                  if best.get('cash_initial') is not None and best.get('cash_final') is not None:
+                      cash_pnl = best['cash_final'] - best['cash_initial']
+                  elements.append({'tag': 'div', 'text': {'tag': 'lark_md',
+                      'content': f'**现金账户**: 初始 {fmt(best.get("cash_initial"), ",.2f")} → 最终 {fmt(best.get("cash_final"), ",.2f")}，盈亏 {fmt(cash_pnl, "+,.2f")}（{fmt(best.get("cash_return"), "+.2f")}%），成交 {int(best.get("cash_trades") or 0)} 笔'}})
 
                   # 参数梯队（完整表格：展示全部组合）
                   elements.append({'tag': 'hr'})

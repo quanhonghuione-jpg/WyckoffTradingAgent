@@ -46,6 +46,11 @@ class GridCell:
     sharpe: float | None
     calmar: float | None
     total_return: float | None
+    cash_initial: float | None
+    cash_final: float | None
+    cash_total_return: float | None
+    cash_trades: int | None
+    cash_commission_total: float | None
     wbt_sharpe: float | None
     wbt_max_drawdown: float | None
     wbt_daily_win_rate: float | None
@@ -171,6 +176,11 @@ def load_grid_cells(artifacts_dir: Path) -> list[GridCell]:
                 sharpe=_extract_float(content, r"夏普比(?:\s*\(Sharpe Ratio\))?"),
                 calmar=_extract_float(content, r"卡玛比(?:\s*\(Calmar Ratio\))?"),
                 total_return=_extract_float(content, "组合总收益"),
+                cash_initial=_extract_float(content, "初始现金"),
+                cash_final=_extract_float(content, "最终现金"),
+                cash_total_return=_extract_float(content, "总收益"),
+                cash_trades=_extract_int(content, "成交笔数"),
+                cash_commission_total=_extract_float(content, "佣金合计"),
                 wbt_sharpe=_extract_float(content, "wbt 夏普比"),
                 wbt_max_drawdown=_extract_float(content, "wbt 最大回撤"),
                 wbt_daily_win_rate=_extract_float(content, "wbt 日胜率"),
@@ -211,6 +221,12 @@ def _fmt_signed(value: float | None, digits: int = 2, suffix: str = "") -> str:
     if value is None:
         return "-"
     return f"{value:+.{digits}f}{suffix}"
+
+
+def _cash_pnl(cell: GridCell) -> float | None:
+    if cell.cash_initial is None or cell.cash_final is None:
+        return None
+    return cell.cash_final - cell.cash_initial
 
 
 def _fmt_param(cell: GridCell) -> str:
@@ -379,6 +395,7 @@ def build_report(cells: list[GridCell], run_url: str = "", generated_at: str = "
         "",
         f"- 最优参数: **{_fmt_param(best)}**",
         f"- 最优夏普: **{_fmt_num(best.sharpe, 3)}**；胜率 **{_fmt_num(best.win_rate, 1, '%')}**；单笔均收 **{_fmt_signed(best.avg_ret, 2, '%')}**；最大回撤 **{_fmt_num(best.max_drawdown, 1, '%')}**；样本 **{best.trades or 0}** 笔",
+        f"- 现金账户: 初始 **{_fmt_num(best.cash_initial, 2)}**；最终 **{_fmt_num(best.cash_final, 2)}**；盈亏 **{_fmt_signed(_cash_pnl(best), 2)}**；收益 **{_fmt_signed(best.cash_total_return, 2, '%')}**；现金成交 **{best.cash_trades or 0}** 笔",
         f"- wbt 校验: 夏普 {_fmt_num(best.wbt_sharpe, 3)}，最大回撤 {_fmt_num(best.wbt_max_drawdown, 2, '%')}，日胜率 {_fmt_num(best.wbt_daily_win_rate, 2, '%')}；绩效引擎 `{best.metrics_engine or '-'}`",
         f"- 参数观察: {_best_per_hold_comment(cells)}",
     ]
@@ -400,8 +417,8 @@ def build_report(cells: list[GridCell], run_url: str = "", generated_at: str = "
             "",
             "## 参数梯队",
             "",
-            "| 排名 | 参数组合 | 夏普 | 胜率 | 均收 | 回撤 | 样本 |",
-            "|---:|---|---:|---:|---:|---:|---:|",
+            "| 排名 | 参数组合 | 夏普 | 胜率 | 均收 | 回撤 | 最终现金 | 现金收益 | 样本 |",
+            "|---:|---|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for idx, cell in enumerate(ranked, 1):
@@ -416,6 +433,8 @@ def build_report(cells: list[GridCell], run_url: str = "", generated_at: str = "
                     _fmt_num(cell.win_rate, 1, "%"),
                     _fmt_signed(cell.avg_ret, 2, "%"),
                     _fmt_num(cell.max_drawdown, 1, "%"),
+                    _fmt_num(cell.cash_final, 2),
+                    _fmt_signed(cell.cash_total_return, 2, "%"),
                     str(cell.trades or 0),
                 ]
             )
