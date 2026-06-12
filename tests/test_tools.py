@@ -9,6 +9,14 @@ from types import ModuleType, SimpleNamespace
 
 import pandas as pd
 
+
+def _money_flow_df(prev_close: float, latest_close: float, latest_amount: float) -> pd.DataFrame:
+    dates = pd.date_range("2026-01-01", periods=20, freq="D").strftime("%Y-%m-%d")
+    close = [prev_close] * 19 + [latest_close]
+    amount = [100_000_000.0] * 19 + [latest_amount]
+    return pd.DataFrame({"date": dates, "close": close, "amount": amount})
+
+
 # ── tools/funnel_config ──
 
 
@@ -142,10 +150,11 @@ class TestCandidateRanker:
 
 class TestMarketRegime:
     def test_imports_callable(self):
-        from tools.market_regime import analyze_benchmark_and_tune_cfg, calc_market_breadth
+        from tools.market_regime import analyze_benchmark_and_tune_cfg, calc_market_breadth, calc_market_money_flow
 
         assert callable(analyze_benchmark_and_tune_cfg)
         assert callable(calc_market_breadth)
+        assert callable(calc_market_money_flow)
 
     def test_calc_market_breadth_empty(self):
         from tools.market_regime import calc_market_breadth
@@ -153,6 +162,32 @@ class TestMarketRegime:
         result = calc_market_breadth({})
         assert result["ratio_pct"] is None
         assert result["sample_size"] == 0
+
+    def test_calc_market_money_flow_detects_entry(self):
+        from tools.market_regime import calc_market_money_flow
+
+        df_map = {
+            "000001": _money_flow_df(10.0, 11.0, 180_000_000),
+            "000002": _money_flow_df(20.0, 21.0, 160_000_000),
+            "000003": _money_flow_df(30.0, 29.7, 60_000_000),
+        }
+        result = calc_market_money_flow(df_map, {"delta_pct": 5.0})
+        assert result["state"] == "主力进场"
+        assert result["trend"] == "entry"
+        assert result["amount_ratio_1_20"] > 1.1
+
+    def test_calc_market_money_flow_detects_retreat(self):
+        from tools.market_regime import calc_market_money_flow
+
+        df_map = {
+            "000001": _money_flow_df(10.0, 9.5, 180_000_000),
+            "000002": _money_flow_df(20.0, 19.0, 160_000_000),
+            "000003": _money_flow_df(30.0, 30.3, 50_000_000),
+        }
+        result = calc_market_money_flow(df_map, {"delta_pct": -6.0})
+        assert result["state"] == "主力撤退"
+        assert result["trend"] == "retreat"
+        assert result["down_amount_yi"] > result["up_amount_yi"]
 
 
 # ── tools/data_fetcher ──

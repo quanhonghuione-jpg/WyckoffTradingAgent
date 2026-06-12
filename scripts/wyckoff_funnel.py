@@ -26,6 +26,7 @@ if __name__ == "__main__" or not __package__:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.dynamic_policy import (
     build_signal_weight_map,
+    dynamic_policy_horizon,
     dynamic_policy_mode,
     filter_triggers_by_registry,
     resolve_dynamic_candidate_policy,
@@ -124,6 +125,12 @@ FUNNEL_EXPORT_FULL_FETCH = os.getenv("FUNNEL_EXPORT_FULL_FETCH", "0").strip().lo
 }
 FUNNEL_EXPORT_DIR = os.getenv("FUNNEL_EXPORT_DIR", "data/funnel_snapshots").strip() or "data/funnel_snapshots"
 FUNNEL_AI_SELECTION_MODE = os.getenv("FUNNEL_AI_SELECTION_MODE", "legacy_full_hits").strip().lower()
+FUNNEL_DEFENSIVE_FORCE_QUOTA = os.getenv("FUNNEL_DEFENSIVE_FORCE_QUOTA", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 FUNNEL_CARD_STYLE = os.getenv("FUNNEL_CARD_STYLE", "legacy_compact").strip().lower()
 FUNNEL_EVR_POLICY = os.getenv("FUNNEL_EVR_POLICY", "all_regimes").strip().lower()
 try:
@@ -131,7 +138,7 @@ try:
 except Exception:
     logger.debug("FUNNEL_BYPASS_DISPLAY_LIMIT parse failed, using default", exc_info=True)
     FUNNEL_BYPASS_DISPLAY_LIMIT = 20
-FUNNEL_L2_BYPASS_AI_ENABLED = os.getenv("FUNNEL_L2_BYPASS_AI_ENABLED", "1").strip().lower() in {
+FUNNEL_L2_BYPASS_AI_ENABLED = os.getenv("FUNNEL_L2_BYPASS_AI_ENABLED", "0").strip().lower() in {
     "1",
     "true",
     "yes",
@@ -213,6 +220,16 @@ try:
 except Exception:
     logger.debug("FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_MIN_SCORE parse failed, using default", exc_info=True)
     FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_MIN_SCORE = 55.0
+FUNNEL_LOSS_GUARD_ENABLED = os.getenv("FUNNEL_LOSS_GUARD_ENABLED", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+FUNNEL_LOSS_GUARD_LOW_SCORE = float(os.getenv("FUNNEL_LOSS_GUARD_LOW_SCORE", "1.0"))
+FUNNEL_LOSS_GUARD_RISK_ON_PRE5_RET = float(os.getenv("FUNNEL_LOSS_GUARD_RISK_ON_PRE5_RET", "25.0"))
+FUNNEL_LOSS_GUARD_RISK_ON_RANGE_POS = float(os.getenv("FUNNEL_LOSS_GUARD_RISK_ON_RANGE_POS", "85.0"))
+FUNNEL_LOSS_GUARD_RISK_ON_VOL_RATIO = float(os.getenv("FUNNEL_LOSS_GUARD_RISK_ON_VOL_RATIO", "1.8"))
 
 
 def _resolve_funnel_end_calendar_day() -> date:
@@ -240,6 +257,9 @@ from tools.market_regime import (
 )
 from tools.market_regime import (
     calc_market_breadth as _calc_market_breadth,
+)
+from tools.market_regime import (
+    calc_market_money_flow as _calc_market_money_flow,
 )
 from tools.symbol_pool import (
     _stock_name_map,
@@ -700,6 +720,116 @@ def _rank_l2_bypass_pool(l2_bypass_pool: list[str], code_to_total_score: dict[st
     return sorted(clean_pool, key=lambda c: (-code_to_total_score.get(c, 0.0), c))
 
 
+def _channel_tags(raw: str) -> set[str]:
+    return {x.strip() for x in str(raw or "").split("+") if x.strip()}
+
+
+def _is_pure_momentum_channel(channel: str) -> bool:
+    tags = _channel_tags(channel)
+    if not tags or "点火破局" in tags:
+        return False
+    return bool(tags <= {"主升通道", "趋势延续", "加速突破"})
+
+
+def _recent_overheat(df: pd.DataFrame | None) -> bool:
+    if df is None or df.empty or len(df) < 21:
+        return False
+    work = df.copy()
+    for col in ("close", "high", "low", "volume"):
+        if col not in work.columns:
+            return False
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    last = work.iloc[-1]
+    close = float(last.get("close") or 0.0)
+    if close <= 0:
+        return False
+    pre = work.tail(21).dropna(subset=["close", "high", "low", "volume"])
+    if len(pre) < 21:
+        return False
+    high20 = float(pre["high"].max())
+    low20 = float(pre["low"].min())
+    pre5_ret = (close / float(pre.iloc[-6]["close"]) - 1.0) * 100.0
+    range_pos = (close - low20) / (high20 - low20) * 100.0 if high20 > low20 else 0.0
+    vol20 = float(pre["volume"].tail(20).mean())
+    vol_ratio = float(pre["volume"].tail(5).mean()) / vol20 if vol20 > 0 else 0.0
+    return (
+        pre5_ret >= FUNNEL_LOSS_GUARD_RISK_ON_PRE5_RET
+        and range_pos >= FUNNEL_LOSS_GUARD_RISK_ON_RANGE_POS
+        and vol_ratio >= FUNNEL_LOSS_GUARD_RISK_ON_VOL_RATIO
+    )
+
+
+def _loss_guard_reason(
+    code: str,
+    regime: str,
+    trigger_keys: list[str],
+    trigger_score: float,
+    channel: str,
+    df_map: dict[str, pd.DataFrame],
+) -> str:
+    if not FUNNEL_LOSS_GUARD_ENABLED:
+        return ""
+    keys = {str(k).strip().lower() for k in trigger_keys if str(k).strip()}
+    regime_norm = str(regime or "NEUTRAL").strip().upper() or "NEUTRAL"
+    if "lps" in keys and not (keys & {"sos", "evr", "spring"}) and trigger_score < FUNNEL_LOSS_GUARD_LOW_SCORE:
+        return "低分LPS"
+    if regime_norm in {"RISK_OFF", "RISK_ON", "PANIC_REPAIR", "CRASH", "BLACK_SWAN"}:
+        if "lps" in keys and not (keys & {"sos", "evr", "spring"}):
+            return f"{regime_norm}禁用LPS"
+        if "trend_pullback" in keys and trigger_score < FUNNEL_LOSS_GUARD_LOW_SCORE:
+            return f"{regime_norm}低分回踩"
+    if regime_norm == "RISK_ON" and (keys & {"sos", "evr", "trend_pullback"}):
+        if _is_pure_momentum_channel(channel):
+            return "RISK_ON纯趋势追涨"
+        if _recent_overheat(df_map.get(code)):
+            return "RISK_ON短期过热"
+    return ""
+
+
+def _apply_loss_guard(
+    selected_for_ai: list[str],
+    trend_selected: list[str],
+    accum_selected: list[str],
+    *,
+    regime: str,
+    code_to_trigger_keys: dict[str, list[str]],
+    code_to_total_score: dict[str, float],
+    channel_map: dict[str, str],
+    df_map: dict[str, pd.DataFrame],
+) -> tuple[list[str], list[str], list[str], dict[str, int]]:
+    kept: list[str] = []
+    dropped: dict[str, int] = {}
+    for code in selected_for_ai:
+        reason = _loss_guard_reason(
+            code,
+            regime,
+            code_to_trigger_keys.get(code, []),
+            float(code_to_total_score.get(code, 0.0) or 0.0),
+            str(channel_map.get(code, "") or ""),
+            df_map,
+        )
+        if reason:
+            dropped[reason] = dropped.get(reason, 0) + 1
+        else:
+            kept.append(code)
+    kept_set = set(kept)
+    return kept, [c for c in trend_selected if c in kept_set], [c for c in accum_selected if c in kept_set], dropped
+
+
+def _should_force_quota_selection(regime: str, full_mode_enabled: bool) -> bool:
+    if not full_mode_enabled or not FUNNEL_DEFENSIVE_FORCE_QUOTA:
+        return False
+    regime_norm = str(regime or "").strip().upper()
+    return regime_norm in {"RISK_OFF", "CRASH", "BLACK_SWAN"}
+
+
+def _promotion_limits(selected_for_ai: list[str], cap: int, total_cap: int | None) -> tuple[int | None, int | None]:
+    item_left = None if cap <= 0 else max(int(cap), 0)
+    if total_cap is None:
+        return item_left, None
+    return item_left, max(int(total_cap) - len(set(selected_for_ai)), 0)
+
+
 def _promote_l2_bypass_for_ai(
     selected_for_ai: list[str],
     trend_selected: list[str],
@@ -711,22 +841,29 @@ def _promote_l2_bypass_for_ai(
     *,
     enabled: bool | None = None,
     cap: int | None = None,
+    total_cap: int | None = None,
     accum_codes: set[str] | None = None,
 ) -> int:
     if not (FUNNEL_L2_BYPASS_AI_ENABLED if enabled is None else enabled) or not l2_bypass_pool:
         return 0
     ranked = _rank_l2_bypass_pool(l2_bypass_pool, code_to_total_score)
     budget = FUNNEL_L2_BYPASS_AI_CAP if cap is None else cap
-    ranked = ranked if budget <= 0 else ranked[:budget]
     selected_seen = set(selected_for_ai)
     track_seen = set(trend_selected) | set(accum_selected)
+    item_left, total_left = _promotion_limits(selected_for_ai, budget, total_cap)
     accum_set = accum_codes or set()
     added = 0
     for code in ranked:
         if code not in selected_seen:
+            if item_left == 0 or total_left == 0:
+                break
             selected_for_ai.append(code)
             selected_seen.add(code)
             added += 1
+            if item_left is not None:
+                item_left -= 1
+            if total_left is not None:
+                total_left -= 1
         score_map.setdefault(code, float(code_to_total_score.get(code, 0.0) or 0.0))
         if code in track_seen:
             continue
@@ -748,7 +885,8 @@ def _load_dynamic_policy_context(regime: str, benchmark_context: dict) -> dict:
     except Exception as exc:
         logger.warning("动态策略上下文加载失败，降级为静态: %s", exc)
         return {"mode": "off", "health": [], "registry": [], "weights": {}, "policy": None}
-    weights = build_signal_weight_map(health_rows, registry_rows, regime=regime)
+    horizon = dynamic_policy_horizon()
+    weights = build_signal_weight_map(health_rows, registry_rows, regime=regime, horizon_days=horizon)
     base_policy = resolve_ai_candidate_policy(regime)
     policy = resolve_dynamic_candidate_policy(
         base_policy,
@@ -758,11 +896,18 @@ def _load_dynamic_policy_context(regime: str, benchmark_context: dict) -> dict:
     if health_rows or registry_rows:
         print(
             "[funnel] 动态策略上下文: "
-            f"mode={mode}, weights={weights or {}}, "
+            f"mode={mode}, horizon={horizon}, weights={weights or {}}, "
             f"TrendWeight={policy.get('trend_health_weight', 1)}, "
             f"AccumWeight={policy.get('accum_health_weight', 1)}"
         )
-    return {"mode": mode, "health": health_rows, "registry": registry_rows, "weights": weights, "policy": policy}
+    return {
+        "mode": mode,
+        "horizon_days": horizon,
+        "health": health_rows,
+        "registry": registry_rows,
+        "weights": weights,
+        "policy": policy,
+    }
 
 
 def _attach_shadow_policy(ai_policy: dict, dynamic_ctx: dict) -> None:
@@ -861,29 +1006,16 @@ def _shadow_selected_codes(
     return trend, accum, score_map
 
 
-def _maybe_persist_policy_shadow_run(
-    *,
+def _policy_shadow_row(
     ai_policy: dict,
     metrics: dict,
-    triggers: dict[str, list[tuple[str, float]]],
     selected_for_ai: list[str],
-    l3_ranked_symbols: list[str],
+    shadow_selected: list[str],
+    diff_added: list[str],
+    diff_removed: list[str],
     regime: str,
-    sector_map: dict[str, str],
 ) -> dict:
-    if ai_policy.get("_dynamic_mode") != "shadow" or not ai_policy.get("_shadow_policy"):
-        return {}
-    shadow_trend, shadow_accum, _score_map = _shadow_selected_codes(
-        metrics,
-        triggers,
-        l3_ranked_symbols,
-        regime,
-        sector_map,
-        ai_policy,
-    )
-    shadow_selected = shadow_trend + shadow_accum
-    diff_added, diff_removed = _selection_diff(selected_for_ai, shadow_selected)
-    row = {
+    return {
         "market": "cn",
         "trade_date": str(metrics.get("end_trade_date") or date.today().isoformat()),
         "regime": str(regime or "NEUTRAL").strip().upper() or "NEUTRAL",
@@ -898,17 +1030,56 @@ def _maybe_persist_policy_shadow_run(
         "health_snapshot": ai_policy.get("_health_rows") or [],
         "updated_at": datetime.now(CN_TZ).isoformat(),
     }
-    written = upsert_policy_shadow_run(row)
-    print(
-        "[funnel] 动态策略shadow已写入 signal_policy_shadow_runs: "
-        f"written={written}, added={len(diff_added)}, removed={len(diff_removed)}"
-    )
+
+
+def _policy_shadow_meta(
+    written: bool,
+    shadow_selected: list[str],
+    diff_added: list[str],
+    diff_removed: list[str],
+    score_map: dict[str, float],
+) -> dict:
     return {
         "shadow_table": "signal_policy_shadow_runs",
         "shadow_written": written,
         "shadow_added_count": len(diff_added),
         "shadow_removed_count": len(diff_removed),
+        "shadow_selected": shadow_selected,
+        "shadow_added": diff_added,
+        "shadow_removed": diff_removed,
+        "shadow_score_map": {code: float(score_map.get(code, 0.0) or 0.0) for code in shadow_selected},
     }
+
+
+def _maybe_persist_policy_shadow_run(
+    *,
+    ai_policy: dict,
+    metrics: dict,
+    triggers: dict[str, list[tuple[str, float]]],
+    selected_for_ai: list[str],
+    l3_ranked_symbols: list[str],
+    regime: str,
+    sector_map: dict[str, str],
+) -> dict:
+    if ai_policy.get("_dynamic_mode") != "shadow" or not ai_policy.get("_shadow_policy"):
+        return {}
+    shadow_trend, shadow_accum, score_map = _shadow_selected_codes(
+        metrics,
+        triggers,
+        l3_ranked_symbols,
+        regime,
+        sector_map,
+        ai_policy,
+    )
+    shadow_selected = shadow_trend + shadow_accum
+    diff_added, diff_removed = _selection_diff(selected_for_ai, shadow_selected)
+    row = _policy_shadow_row(ai_policy, metrics, selected_for_ai, shadow_selected, diff_added, diff_removed, regime)
+    written = upsert_policy_shadow_run(row)
+    print(
+        "[funnel] 动态策略shadow已写入 signal_policy_shadow_runs: "
+        f"written={written}, added={len(diff_added)}, removed={len(diff_removed)}"
+    )
+    return _policy_shadow_meta(written, shadow_selected, diff_added, diff_removed, score_map)
 
 
 def _load_theme_radar_history() -> dict:
@@ -1049,19 +1220,27 @@ def _promote_theme_l4_for_ai(
     code_to_total_score: dict[str, float],
     code_to_trigger_keys: dict[str, list[str]],
     score_map: dict[str, float],
+    *,
+    total_cap: int | None = None,
 ) -> int:
     ranked = [code for code in formal_hit_set if code in theme_bonus_map]
     ranked.sort(key=lambda c: (-float(code_to_total_score.get(c, 0.0) or 0.0), c))
-    ranked = ranked if FUNNEL_THEME_RADAR_PROMOTE_CAP <= 0 else ranked[:FUNNEL_THEME_RADAR_PROMOTE_CAP]
     selected_seen = set(selected_for_ai)
     track_seen = set(trend_selected) | set(accum_selected)
+    item_left, total_left = _promotion_limits(selected_for_ai, FUNNEL_THEME_RADAR_PROMOTE_CAP, total_cap)
     added = 0
     for code in ranked:
         score_map.setdefault(code, float(code_to_total_score.get(code, 0.0) or 0.0))
         if code not in selected_seen:
+            if item_left == 0 or total_left == 0:
+                break
             selected_for_ai.append(code)
             selected_seen.add(code)
             added += 1
+            if item_left is not None:
+                item_left -= 1
+            if total_left is not None:
+                total_left -= 1
         if code in track_seen:
             continue
         if _is_accum_trigger(code_to_trigger_keys.get(code, [])):
@@ -1105,13 +1284,124 @@ def _signal_report_fields(
         signal = str(key or "").strip()
         if signal and signal not in signal_types:
             signal_types.append(signal)
+    primary_signal = signal_types[0] if signal_types else ("strategic_review" if str(track or "").strip() else "")
     return {
-        "primary_signal": signal_types[0] if signal_types else "",
+        "primary_signal": primary_signal,
         "signal_types": signal_types,
         "signal_track": str(track or "").strip(),
         "market_regime": str(regime or "NEUTRAL").strip().upper() or "NEUTRAL",
         "trigger_score": _safe_float(trigger_score),
     }
+
+
+def _full_formal_ai_selection(
+    formal_sorted_codes: list[str],
+    code_to_best_score: dict[str, float],
+    code_to_trigger_keys: dict[str, list[str]],
+) -> tuple[list[str], list[str], list[str], dict[str, float], dict]:
+    selected_for_ai = list(formal_sorted_codes)
+    trend_selected, accum_selected = _split_selected_tracks(selected_for_ai, code_to_trigger_keys)
+    ai_policy = {
+        "total_cap": len(formal_sorted_codes),
+        "trend_quota": len(trend_selected),
+        "accum_quota": len(accum_selected),
+        "requested_trend_quota": len(trend_selected),
+        "requested_accum_quota": len(accum_selected),
+        "quota_family": "FULL_FORMAL_L4",
+        "max_trend_l3_fill": 0,
+        "max_accum_l3_fill": 0,
+    }
+    score_map = {c: float(code_to_best_score.get(c, 0.0)) for c in formal_sorted_codes}
+    print(
+        f"[funnel] AI候选分配完成(full_formal_l4): "
+        f"Trend={len(trend_selected)}, Accum={len(accum_selected)}, total={len(selected_for_ai)}"
+    )
+    return selected_for_ai, trend_selected, accum_selected, score_map, ai_policy
+
+
+def _select_base_ai_candidates(
+    metrics: dict,
+    triggers: dict[str, list[tuple[str, float]]],
+    l3_ranked_symbols: list[str],
+    regime: str,
+    sector_map: dict[str, str],
+    benchmark_context: dict,
+    formal_sorted_codes: list[str],
+    code_to_best_score: dict[str, float],
+    code_to_trigger_keys: dict[str, list[str]],
+    *,
+    full_mode_enabled: bool,
+) -> tuple[list[str], list[str], list[str], dict[str, float], dict, bool]:
+    force_quota = _should_force_quota_selection(regime, full_mode_enabled)
+    use_full_ai_selection = full_mode_enabled and not force_quota
+    if force_quota:
+        print(f"[funnel] 防守市场 {regime}: 强制从 full_l4 切换为 quota 选股")
+    if use_full_ai_selection:
+        result = _full_formal_ai_selection(formal_sorted_codes, code_to_best_score, code_to_trigger_keys)
+        if dynamic_policy_mode() == "shadow":
+            _attach_shadow_policy(result[4], _load_dynamic_policy_context(str(regime), benchmark_context))
+        return (*result, True)
+    trend_selected, accum_selected, score_map, ai_policy = _allocate_candidates_for_ai(
+        metrics,
+        triggers,
+        l3_ranked_symbols,
+        str(regime),
+        sector_map,
+        benchmark_context,
+    )
+    return trend_selected + accum_selected, trend_selected, accum_selected, score_map, ai_policy, False
+
+
+def _promote_review_candidates(
+    selected_for_ai: list[str],
+    trend_selected: list[str],
+    accum_selected: list[str],
+    pools: dict[str, list[str] | set[str]],
+    code_to_total_score: dict[str, float],
+    code_to_trigger_keys: dict[str, list[str]],
+    score_map: dict[str, float],
+    ai_policy: dict,
+    use_full_ai_selection: bool,
+    theme_bonus_map: dict[str, float],
+) -> tuple[int, int, int]:
+    if not use_full_ai_selection:
+        _apply_theme_bonus_to_scores(score_map, theme_bonus_map)
+    ai_total_cap = int(ai_policy.get("total_cap") or 0)
+    bypass_added = _promote_l2_bypass_for_ai(
+        selected_for_ai,
+        trend_selected,
+        accum_selected,
+        list(pools["l2_bypass"]),
+        code_to_total_score,
+        code_to_trigger_keys,
+        score_map,
+        total_cap=ai_total_cap,
+    )
+    strategic_added = _promote_l2_bypass_for_ai(
+        selected_for_ai,
+        trend_selected,
+        accum_selected,
+        list(pools["strategic_l2_bypass"]),
+        code_to_total_score,
+        code_to_trigger_keys,
+        score_map,
+        enabled=FUNNEL_STRATEGIC_L2_BYPASS_ENABLED,
+        cap=FUNNEL_STRATEGIC_L2_BYPASS_AI_CAP,
+        total_cap=ai_total_cap,
+        accum_codes=set(pools["strategic_accum"]),
+    )
+    theme_added = _promote_theme_l4_for_ai(
+        selected_for_ai,
+        trend_selected,
+        accum_selected,
+        set(pools["formal_hit"]),
+        theme_bonus_map,
+        code_to_total_score,
+        code_to_trigger_keys,
+        score_map,
+        total_cap=ai_total_cap,
+    )
+    return bypass_added, strategic_added, theme_added
 
 
 def _candidate_reason_text(code: str, code_to_reasons: dict[str, list[str]], badge_map: dict[str, str]) -> str:
@@ -1120,6 +1410,19 @@ def _candidate_reason_text(code: str, code_to_reasons: dict[str, list[str]], bad
     if badge and badge not in reasons:
         reasons.append(badge)
     return "、".join(reasons) or "威科夫候选"
+
+
+def _money_flow_report_line(benchmark_context: dict | None) -> str:
+    if not benchmark_context:
+        return "暂无资金趋势"
+    money_flow = benchmark_context.get("money_flow") or {}
+    summary = str(money_flow.get("summary") or "").strip()
+    if summary:
+        return summary
+    state = str(money_flow.get("state") or "未知").strip()
+    score = money_flow.get("score")
+    sample = int(money_flow.get("sample_size") or 0)
+    return f"{state}，资金分 {score}，样本 {sample} 只。"
 
 
 def _strategic_bypass_seed_codes(
@@ -1363,11 +1666,13 @@ def run_funnel_job(
     )
 
     breadth_context = _calc_market_breadth(all_df_map, BREADTH_MA_WINDOW)
+    money_flow_context = _calc_market_money_flow(all_df_map, breadth_context)
     benchmark_context = _analyze_benchmark_and_tune_cfg(
         bench_df,
         smallcap_df,
         cfg,
         breadth=breadth_context,
+        money_flow=money_flow_context,
     )
     print(
         "[funnel] 大盘总闸: "
@@ -1377,6 +1682,7 @@ def run_funnel_job(
         f"recent3_cum={benchmark_context['recent3_cum_pct']}, "
         f"smallcap_code={benchmark_context.get('smallcap_code')}, smallcap_today={benchmark_context.get('smallcap_today_pct')}, "
         f"breadth={benchmark_context.get('breadth')}, "
+        f"money_flow={benchmark_context.get('money_flow')}, "
         f"panic_triggered={benchmark_context.get('panic_triggered')}, panic_reasons={benchmark_context.get('panic_reasons')}, "
         f"repair_triggered={benchmark_context.get('repair_triggered')}, repair_reasons={benchmark_context.get('repair_reasons')}, "
         f"tuned={benchmark_context['tuned']}"
@@ -1716,89 +2022,51 @@ def run(
     }
     # 策略：大盘水温驱动的双轨制（Top-Down 择时顺势策略）
     regime = benchmark_context.get("regime", "NEUTRAL")
-    if use_full_formal_l4_selection or use_legacy_selection:
-        selected_for_ai = list(formal_sorted_codes)
-        trend_selected, accum_selected = _split_selected_tracks(selected_for_ai, code_to_trigger_keys)
-        score_map = {c: float(code_to_best_score.get(c, 0.0)) for c in formal_sorted_codes}
-        ai_policy = {
-            "total_cap": len(formal_sorted_codes),
-            "trend_quota": len(trend_selected),
-            "accum_quota": len(accum_selected),
-            "requested_trend_quota": len(trend_selected),
-            "requested_accum_quota": len(accum_selected),
-            "quota_family": "FULL_FORMAL_L4",
-            "max_trend_l3_fill": 0,
-            "max_accum_l3_fill": 0,
-        }
-        print(
-            f"[funnel] AI候选分配完成(full_formal_l4): "
-            f"Trend={len(trend_selected)}, Accum={len(accum_selected)}, total={len(selected_for_ai)}"
-        )
-        if dynamic_policy_mode() == "shadow":
-            _attach_shadow_policy(ai_policy, _load_dynamic_policy_context(str(regime), benchmark_context))
-    else:
-        trend_selected, accum_selected, score_map, ai_policy = _allocate_candidates_for_ai(
+    full_mode_enabled = use_full_formal_l4_selection or use_legacy_selection
+    selected_for_ai, trend_selected, accum_selected, score_map, ai_policy, use_full_ai_selection = (
+        _select_base_ai_candidates(
             metrics,
             triggers,
             l3_ranked_symbols,
             str(regime),
             sector_map,
             benchmark_context,
+            formal_sorted_codes,
+            code_to_best_score,
+            code_to_trigger_keys,
+            full_mode_enabled=full_mode_enabled,
         )
-        selected_for_ai = trend_selected + accum_selected
-
-    if not (use_full_formal_l4_selection or use_legacy_selection):
-        _apply_theme_bonus_to_scores(score_map, theme_bonus_map)
-
-    bypass_added = _promote_l2_bypass_for_ai(
+    )
+    bypass_added, strategic_bypass_added, theme_promoted_count = _promote_review_candidates(
         selected_for_ai,
         trend_selected,
         accum_selected,
-        l2_bypass_pool,
+        {
+            "l2_bypass": l2_bypass_pool,
+            "strategic_l2_bypass": strategic_l2_bypass_pool,
+            "strategic_accum": strategic_accum_codes,
+            "formal_hit": formal_hit_set,
+        },
         code_to_total_score,
         code_to_trigger_keys,
         score_map,
-    )
-    if bypass_added:
-        print(
-            f"[funnel] L2明珠旁路送审: added={bypass_added}, "
-            f"budget={FUNNEL_L2_BYPASS_AI_CAP or 'unlimited'}, pool={len(l2_bypass_pool)}"
-        )
-
-    strategic_bypass_added = _promote_l2_bypass_for_ai(
-        selected_for_ai,
-        trend_selected,
-        accum_selected,
-        strategic_l2_bypass_pool,
-        code_to_total_score,
-        code_to_trigger_keys,
-        score_map,
-        enabled=FUNNEL_STRATEGIC_L2_BYPASS_ENABLED,
-        cap=FUNNEL_STRATEGIC_L2_BYPASS_AI_CAP,
-        accum_codes=strategic_accum_codes,
-    )
-    if strategic_bypass_added:
-        print(
-            f"[funnel] 战略L2旁路送审: added={strategic_bypass_added}, "
-            f"budget={FUNNEL_STRATEGIC_L2_BYPASS_AI_CAP or 'unlimited'}, "
-            f"pool={len(strategic_l2_bypass_pool)}"
-        )
-
-    theme_promoted_count = _promote_theme_l4_for_ai(
-        selected_for_ai,
-        trend_selected,
-        accum_selected,
-        formal_hit_set,
+        ai_policy,
+        use_full_ai_selection,
         theme_bonus_map,
-        code_to_total_score,
-        code_to_trigger_keys,
-        score_map,
     )
-    if theme_promoted_count:
-        print(
-            f"[funnel] 战略主线联动送审: added={theme_promoted_count}, "
-            f"cap={FUNNEL_THEME_RADAR_PROMOTE_CAP or 'unlimited'}, l4_hit={theme_l4_count}"
-        )
+    selected_for_ai, trend_selected, accum_selected, loss_guard_dropped = _apply_loss_guard(
+        selected_for_ai,
+        trend_selected,
+        accum_selected,
+        regime=str(regime),
+        code_to_trigger_keys=code_to_trigger_keys,
+        code_to_total_score=code_to_total_score,
+        channel_map=l2_channel_map,
+        df_map=metrics.get("all_df_map", {}) or {},
+    )
+    if loss_guard_dropped:
+        ai_policy["loss_guard_dropped"] = loss_guard_dropped
+        print(f"[funnel] loss guard过滤候选: {loss_guard_dropped}")
 
     min_funnel_score = float(metrics.get("min_funnel_score", 0.0) or 0.0)
     if score_map and min_funnel_score > 0:
@@ -1831,6 +2099,7 @@ def run(
     if use_legacy_card and use_legacy_selection:
         bench_line = "未知"
         pv_line = "暂无大盘量价推演"
+        money_line = _money_flow_report_line(benchmark_context)
         if benchmark_context:
             _close = benchmark_context.get("close") or 0
             _ma50 = benchmark_context.get("ma50") or 0
@@ -1853,6 +2122,7 @@ def run(
             ),
             f"**漏斗概览**: {metrics['total_symbols']}只 → L1:{metrics['layer1']} → L2:{metrics['layer2']} → L3:{metrics['layer3']} → 命中:{metrics['total_hits']}",
             f"**大盘水温**: {bench_line}",
+            f"**大盘资金趋势**: {money_line}",
             f"**大盘量价推演**: {pv_line}",
             f"**中长线主线**: {summarize_theme_radar(metrics.get('theme_radar') or {})} ({theme_radar_source})",
             (
@@ -2055,6 +2325,9 @@ def run(
                 "trend_selected": [],
                 "accum_selected": [],
                 "priority_score_map": score_map,
+                "shadow_added": ai_policy.get("shadow_added", []) or [],
+                "shadow_removed": ai_policy.get("shadow_removed", []) or [],
+                "shadow_score_map": ai_policy.get("shadow_score_map", {}) or {},
                 "name_map": name_map,
                 "sector_map": sector_map,
                 "all_df_map": all_df_map,
@@ -2103,6 +2376,7 @@ def run(
 
     bench_line = "未知"
     pv_line = "暂无大盘量价推演"
+    money_line = _money_flow_report_line(benchmark_context)
     if benchmark_context:
         _close = benchmark_context.get("close") or 0
         _ma50 = benchmark_context.get("ma50") or 0
@@ -2124,6 +2398,7 @@ def run(
         ),
         f"**漏斗概览**: {metrics['total_symbols']}只 → L1:{metrics['layer1']} → L2:{metrics['layer2']} → L3:{metrics['layer3']} → 正式L4:{unique_hit_count}",
         f"**大盘水温**: {bench_line}",
+        f"**大盘资金趋势**: {money_line}",
         f"**大盘量价推演**: {pv_line}",
         f"**中长线主线**: {summarize_theme_radar(metrics.get('theme_radar') or {})} ({theme_radar_source})",
         (
@@ -2314,6 +2589,9 @@ def run(
             "trend_selected": trend_selected,
             "accum_selected": accum_selected,
             "priority_score_map": score_map,
+            "shadow_added": ai_policy.get("shadow_added", []) or [],
+            "shadow_removed": ai_policy.get("shadow_removed", []) or [],
+            "shadow_score_map": ai_policy.get("shadow_score_map", {}) or {},
             "name_map": name_map,
             "sector_map": sector_map,
             "all_df_map": all_df_map,

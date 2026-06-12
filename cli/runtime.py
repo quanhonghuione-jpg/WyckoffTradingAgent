@@ -145,12 +145,14 @@ class AgentRuntime:
         scratchpad: AgentScratchpad | None = None,
         max_tool_rounds: int = MAX_TOOL_ROUNDS,
         cancel_check: Callable[[], bool] | None = None,
+        stream_chunk_timeout: float = STREAM_CHUNK_TIMEOUT,
     ) -> None:
         self.provider = provider
         self.tools = tools
         self.scratchpad = scratchpad
         self.max_tool_rounds = max_tool_rounds
         self.cancel_check = cancel_check
+        self.stream_chunk_timeout = stream_chunk_timeout
 
     def run_stream(
         self,
@@ -247,7 +249,7 @@ class AgentRuntime:
     ) -> Iterator[RuntimeEvent | RoundState]:
         round_state = RoundState()
         stream = self.provider.chat_stream(messages, self.tools.schemas(), system_prompt)
-        for chunk in _iter_with_timeout(stream, STREAM_CHUNK_TIMEOUT, self.cancel_check):
+        for chunk in _iter_with_timeout(stream, self.stream_chunk_timeout, self.cancel_check):
             event = self._consume_model_chunk(round_state, chunk, round_number)
             if event:
                 yield event

@@ -79,17 +79,22 @@ jobs:
       STEP4_PROBE_BUDGET_LIMIT: "0.10"
       STEP4_ATTACK_BUDGET_LIMIT: "0.20"
       STEP4_BUY_BLOCK_REGIMES: "CRASH,BLACK_SWAN,RISK_OFF"
-      # AI 候选选择：正式 L4 全量进入 Step3，Trend/Accum 仅用于分轨研报。
-      FUNNEL_AI_SELECTION_MODE: "all_formal_l4"
-      FUNNEL_AI_TOTAL_CAP: "8"
+      # AI 候选选择：按市场水温和信号反馈动态收缩，防止弱市全量 L4 过筛。
+      FUNNEL_AI_SELECTION_MODE: ${{ vars.FUNNEL_AI_SELECTION_MODE || 'quota' }}
+      FUNNEL_AI_TOTAL_CAP: "5"
       # off=静态配额；shadow=旁路记录动态策略差异；on=正式启用动态配额。
-      FUNNEL_DYNAMIC_POLICY: ${{ vars.FUNNEL_DYNAMIC_POLICY || secrets.FUNNEL_DYNAMIC_POLICY || 'off' }}
-      FUNNEL_AI_RISK_ON_TREND: "3"
-      FUNNEL_AI_RISK_ON_ACCUM: "5"
-      FUNNEL_AI_RISK_OFF_TREND: "0"
+      FUNNEL_DYNAMIC_POLICY: ${{ vars.FUNNEL_DYNAMIC_POLICY || secrets.FUNNEL_DYNAMIC_POLICY || 'on' }}
+      FUNNEL_DYNAMIC_POLICY_HORIZON: "5"
+      FUNNEL_DEFENSIVE_FORCE_QUOTA: "1"
+      FUNNEL_AI_RISK_ON_TREND: "4"
+      FUNNEL_AI_RISK_ON_ACCUM: "1"
+      FUNNEL_AI_RISK_OFF_TREND: "1"
       FUNNEL_AI_RISK_OFF_ACCUM: "0"
       FUNNEL_AI_NEUTRAL_TREND: "2"
-      FUNNEL_AI_NEUTRAL_ACCUM: "3"
+      FUNNEL_AI_NEUTRAL_ACCUM: "0"
+      FUNNEL_L2_BYPASS_AI_ENABLED: "0"
+      FUNNEL_STRATEGIC_L2_BYPASS_AI_CAP: "2"
+      FUNNEL_THEME_RADAR_PROMOTE_CAP: "2"
       DAILY_JOB_ARTIFACTS_DIR: ${{ github.workspace }}/artifacts
       TZ: Asia/Shanghai
 

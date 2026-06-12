@@ -34,6 +34,13 @@ interface Recommendation {
   funnel_score: number | null
   recommend_count: number | null
   recommend_reason: string | null
+  springboard_a?: boolean | null
+  springboard_b?: boolean | null
+  springboard_c?: boolean | null
+  springboard_combo?: string | null
+  springboard_grade?: string | null
+  springboard_met_count?: number | null
+  springboard_scored?: boolean | null
 }
 
 interface SummaryStats {
@@ -526,12 +533,12 @@ function TrackingTable({
   return (
     <div className="overflow-hidden rounded-lg border border-border">
       <div className="overflow-x-auto">
-        <table className="w-full text-sm">
+        <table className="min-w-[1120px] w-full text-sm">
           <TrackingTableHead market={market} sortBy={sortBy} sortOrder={sortOrder} onSortChange={onSortChange} />
           <tbody style={{ contentVisibility: 'auto', containIntrinsicSize: '0 40000px' }}>
             {rows.length === 0 ? (
               <tr className="border-t border-border">
-                <td colSpan={market === 'us' ? 11 : 8} className="px-3 py-8 text-center text-muted-foreground">
+                <td colSpan={trackingColumnCount(market)} className="px-3 py-8 text-center text-muted-foreground">
                   {t('tracking.empty')}
                 </td>
               </tr>
@@ -569,6 +576,7 @@ function TrackingTableHead({
         <SortableHeader align="right" active={sortBy === 'change'} label={t('tracking.changePct')} order={sortOrder} onClick={() => onSortChange('change')} />
         <SortableHeader align="right" active={sortBy === 'score'} label={t('tracking.score')} order={sortOrder} onClick={() => onSortChange('score')} />
         {market === 'us' && <UsPerformanceHeaders sortBy={sortBy} sortOrder={sortOrder} onSortChange={onSortChange} />}
+        <th className="px-3 py-2 text-center font-medium">{t('tracking.springboard')}</th>
         <th className="px-3 py-2 text-center font-medium">AI</th>
       </tr>
     </thead>
@@ -653,10 +661,39 @@ function TrackingRow({ row, market = 'cn' }: { row: Recommendation; market?: Mar
       </td>
       {market === 'us' && <UsPerformanceCells row={row} />}
       <td className="px-3 py-2 text-center">
+        <SpringboardBadge row={row} />
+      </td>
+      <td className="px-3 py-2 text-center">
         {row.is_ai_recommended && <span className="inline-block h-2 w-2 rounded-full bg-indigo-500" />}
       </td>
     </tr>
   )
+}
+
+function SpringboardBadge({ row }: { row: Recommendation }) {
+  const combo = springboardCombo(row)
+  if (combo === '-') return <span className="text-muted-foreground">-</span>
+  const active = row.is_ai_recommended && combo !== 'none'
+  const cls = active
+    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+    : 'border-border bg-muted text-muted-foreground'
+  return <span className={`inline-flex min-w-[3.5rem] justify-center rounded-full border px-2 py-0.5 text-xs font-medium ${cls}`}>{combo}</span>
+}
+
+function springboardCombo(row: Recommendation): string {
+  const raw = (row.springboard_combo || row.springboard_grade || '').trim()
+  if (raw) return raw
+  const parts = [
+    row.springboard_a ? 'A' : '',
+    row.springboard_b ? 'B' : '',
+    row.springboard_c ? 'C' : '',
+  ].filter(Boolean)
+  if (parts.length > 0) return parts.join('+')
+  return row.springboard_scored ? 'none' : '-'
+}
+
+function trackingColumnCount(market: MarketTab): number {
+  return market === 'us' ? 12 : 9
 }
 
 function trackingScoreKind(row: Recommendation): 'priority' | 'raw' | null {

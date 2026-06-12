@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import logging
 import re
+from hashlib import sha256
+from json import dumps, loads
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -66,6 +68,10 @@ _LAYER_TYPES = {
 DEFAULT_MAX_CHARS_PER_MEMORY = 200
 DEFAULT_MAX_TOTAL_RECALL_CHARS = 1200
 _RECALL_TRUNCATION_SUFFIX = "…（已截断，可用 wyckoff memory trace 查看来源）"
+_LAYER_SOURCE_LIMIT = 30
+_LAYER_MIN_ATOMS = 3
+_LAYER_VERSION = 2
+_LAYER_NEW_ATOMS_THRESHOLD = 3
 
 
 def extract_stock_codes(text: str) -> list[str]:
@@ -199,18 +205,81 @@ def _save_summary_memories(summary: str, codes: str, source_ref: str, dedup_prov
     return saved
 
 
-def refresh_memory_layers(provider: Any) -> int:
-    from integrations.local_db import get_recent_memories, save_memory
+def _metadata(memory: dict) -> dict:
+    raw = memory.get("metadata") or ""
+    if not raw:
+        return {}
+    try:
+        data = loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
 
-    atoms = [m for m in get_recent_memories(limit=30) if m.get("memory_type") in {"preference", "decision"}]
-    if len(atoms) < 3:
+
+def _layer_source(atoms: list[dict]) -> tuple[list[int], str]:
+    payload = sorted(
+        [{"id": int(m["id"]), "type": m.get("memory_type"), "content": m.get("content")} for m in atoms],
+        key=lambda item: item["id"],
+    )
+    ids = [item["id"] for item in payload]
+    source_hash = sha256(dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    return ids, source_hash
+
+
+def _recent_layer_atoms(limit: int = _LAYER_SOURCE_LIMIT) -> list[dict]:
+    from integrations.local_db import get_recent_memories
+
+    rows = get_recent_memories(memory_level="L1", limit=limit * 2)
+    atoms = [m for m in rows if m.get("memory_type") in {"preference", "decision"}]
+    return atoms[:limit]
+
+
+def _layer_refresh_records() -> list[dict]:
+    from integrations.local_db import get_recent_memories
+
+    rows = get_recent_memories(memory_type="persona", limit=5)
+    rows.extend(get_recent_memories(memory_type="scenario", limit=20))
+    return [m for m in rows if _metadata(m).get("extractor") == "layer_refresh"]
+
+
+def _should_refresh_layers(atoms: list[dict]) -> tuple[bool, list[int], str]:
+    if len(atoms) < _LAYER_MIN_ATOMS:
+        return False, [], ""
+    source_ids, source_hash = _layer_source(atoms)
+    records = _layer_refresh_records()
+    if any(_metadata(m).get("source_hash") == source_hash for m in records):
+        return False, source_ids, source_hash
+    last_ids: set[int] = set()
+    if records:
+        latest = max(records, key=lambda m: str(m.get("created_at", "")))
+        last_ids = {int(i) for i in _metadata(latest).get("source_l1_ids", [])}
+    new_count = len([i for i in source_ids if i not in last_ids])
+    return (not records or new_count >= _LAYER_NEW_ATOMS_THRESHOLD), source_ids, source_hash
+
+
+def _layer_metadata(source_ids: list[int], source_hash: str) -> dict:
+    return {
+        "extractor": "layer_refresh",
+        "layer_version": _LAYER_VERSION,
+        "source_l1_ids": source_ids,
+        "source_hash": source_hash,
+    }
+
+
+def refresh_memory_layers(provider: Any) -> int:
+    from integrations.local_db import save_memory
+
+    atoms = _recent_layer_atoms()
+    should_refresh, source_ids, source_hash = _should_refresh_layers(atoms)
+    if not should_refresh:
         return 0
     lines = [f"- #{m.get('id')} [{m.get('memory_type')}] {m.get('content')}" for m in atoms]
     layered = _provider_text(provider, "\n".join(lines), _LAYER_REFRESH_PROMPT)
+    metadata = _layer_metadata(source_ids, source_hash)
     saved = 0
     for memory_type, level, content in _layer_memories(layered):
         codes = ",".join(extract_stock_codes(content)[:20])
-        saved += int(bool(save_memory(memory_type, content, codes=codes, memory_level=level)))
+        saved += int(bool(save_memory(memory_type, content, codes=codes, memory_level=level, metadata=metadata)))
     return saved
 
 
@@ -296,11 +365,23 @@ def _append_atom_lines(lines: list[str], memories: list[dict], max_chars: int) -
     lines.extend(_memory_line(m, max_chars=max_chars) for m in atoms)
 
 
+def _filter_seen(memories: list[dict], seen_ids: set[int]) -> list[dict]:
+    filtered: list[dict] = []
+    for memory in memories:
+        mid = memory.get("id")
+        if mid is not None and int(mid) in seen_ids:
+            continue
+        filtered.append(memory)
+    return filtered
+
+
 def _build_recall_lines(memories: list[dict], personas: list[dict], prefs: list[dict], max_chars: int) -> list[str]:
     lines: list[str] = []
     _append_profile_lines(lines, personas, prefs, max_chars)
-    _append_scenario_lines(lines, memories, max_chars)
-    _append_atom_lines(lines, memories, max_chars)
+    seen_ids = {int(m["id"]) for m in personas + prefs if m.get("id") is not None}
+    filtered = _filter_seen(memories, seen_ids)
+    _append_scenario_lines(lines, filtered, max_chars)
+    _append_atom_lines(lines, filtered, max_chars)
     return lines
 
 

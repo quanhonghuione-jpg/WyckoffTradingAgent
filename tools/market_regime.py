@@ -37,6 +37,10 @@ PANIC_REPAIR_ENABLE = os.getenv("FUNNEL_PANIC_REPAIR_ENABLE", "1").strip().lower
 PANIC_REPAIR_MAIN_REBOUND_PCT = float(os.getenv("FUNNEL_PANIC_REPAIR_MAIN_REBOUND_PCT", "0.8"))
 PANIC_REPAIR_SMALL_REBOUND_PCT = float(os.getenv("FUNNEL_PANIC_REPAIR_SMALL_REBOUND_PCT", "1.5"))
 FUNNEL_EVR_POLICY = os.getenv("FUNNEL_EVR_POLICY", "all_regimes").strip().lower()
+MONEY_FLOW_LOOKBACK = int(os.getenv("FUNNEL_MONEY_FLOW_LOOKBACK", "20"))
+MONEY_FLOW_EXPAND_RATIO = float(os.getenv("FUNNEL_MONEY_FLOW_EXPAND_RATIO", "1.10"))
+MONEY_FLOW_CONTRACT_RATIO = float(os.getenv("FUNNEL_MONEY_FLOW_CONTRACT_RATIO", "0.85"))
+MONEY_FLOW_DOMINANCE_RATIO = float(os.getenv("FUNNEL_MONEY_FLOW_DOMINANCE_RATIO", "1.20"))
 
 _PV_OUTLOOK_FALLBACK: dict[str, str] = {
     "RISK_ON": "次日推演：若量能维持在20日均量0.95x上方且不破MA50，偏强震荡延续；若放量跌破MA50，需转入防守。",
@@ -177,11 +181,151 @@ def calc_market_breadth(
     }
 
 
+def _sorted_daily_frame(df: pd.DataFrame) -> pd.DataFrame:
+    work = df.copy()
+    if "date" in work.columns:
+        work = work.sort_values("date")
+    return work.reset_index(drop=True)
+
+
+def _symbol_money_snapshot(df: pd.DataFrame, lookback: int) -> dict | None:
+    if df is None or df.empty or "amount" not in df.columns:
+        return None
+    work = _sorted_daily_frame(df)
+    close = pd.to_numeric(work.get("close"), errors="coerce")
+    amount = pd.to_numeric(work.get("amount"), errors="coerce")
+    valid = pd.DataFrame({"close": close, "amount": amount}).dropna()
+    if len(valid) < 2:
+        return None
+    latest_amount = float(valid["amount"].iloc[-1])
+    if latest_amount <= 0:
+        return None
+    prev_close = float(valid["close"].iloc[-2])
+    latest_close = float(valid["close"].iloc[-1])
+    pct = (latest_close / prev_close - 1.0) * 100.0 if prev_close > 0 else 0.0
+    positive_amount = valid["amount"][valid["amount"] > 0]
+    return {
+        "pct": pct,
+        "latest_amount": latest_amount,
+        "prev_amount": float(valid["amount"].iloc[-2]) if float(valid["amount"].iloc[-2]) > 0 else 0.0,
+        "mean_amount": float(positive_amount.tail(lookback).mean()) if not positive_amount.empty else 0.0,
+        "recent3_amount": float(positive_amount.tail(3).mean()) if not positive_amount.empty else 0.0,
+    }
+
+
+def _money_flow_totals(snapshots: list[dict]) -> dict[str, float | int]:
+    up_amount = sum(item["latest_amount"] for item in snapshots if item["pct"] > 0)
+    down_amount = sum(item["latest_amount"] for item in snapshots if item["pct"] < 0)
+    return {
+        "sample_size": len(snapshots),
+        "total_amount": sum(item["latest_amount"] for item in snapshots),
+        "prev_total_amount": sum(item["prev_amount"] for item in snapshots),
+        "mean_amount": sum(item["mean_amount"] for item in snapshots),
+        "recent3_amount": sum(item["recent3_amount"] for item in snapshots),
+        "up_amount": up_amount,
+        "down_amount": down_amount,
+        "flat_amount": sum(item["latest_amount"] for item in snapshots if item["pct"] == 0),
+        "advancing_count": sum(1 for item in snapshots if item["pct"] > 0),
+        "declining_count": sum(1 for item in snapshots if item["pct"] < 0),
+    }
+
+
+def _safe_ratio(numerator: float, denominator: float) -> float | None:
+    return float(numerator / denominator) if denominator and denominator > 0 else None
+
+
+def _classify_money_flow(amount_ratio: float | None, up_down_ratio: float | None, breadth_delta: float | None) -> str:
+    expanded = amount_ratio is not None and amount_ratio >= MONEY_FLOW_EXPAND_RATIO
+    contracted = amount_ratio is not None and amount_ratio <= MONEY_FLOW_CONTRACT_RATIO
+    up_dominant = up_down_ratio is not None and up_down_ratio >= MONEY_FLOW_DOMINANCE_RATIO
+    down_dominant = up_down_ratio is not None and up_down_ratio <= 1.0 / MONEY_FLOW_DOMINANCE_RATIO
+    breadth_ok = breadth_delta is None or breadth_delta >= 0
+    breadth_bad = breadth_delta is not None and breadth_delta < 0
+    if expanded and up_dominant and breadth_ok:
+        return "主力进场"
+    if expanded and down_dominant and breadth_bad:
+        return "主力撤退"
+    if expanded:
+        return "放量分歧"
+    if contracted and up_dominant:
+        return "缩量反弹"
+    if contracted:
+        return "缩量观望"
+    if up_dominant:
+        return "资金偏进"
+    if down_dominant:
+        return "资金偏撤"
+    return "资金均衡"
+
+
+def _money_flow_score(
+    amount_ratio: float | None, up_amount: float, down_amount: float, breadth_delta: float | None
+) -> float:
+    total_directional = up_amount + down_amount
+    direction = (up_amount - down_amount) / total_directional if total_directional > 0 else 0.0
+    expansion = (amount_ratio - 1.0) if amount_ratio is not None else 0.0
+    breadth_part = (breadth_delta or 0.0) / 20.0
+    return round(direction * 60.0 + expansion * 35.0 + breadth_part * 20.0, 1)
+
+
+def _money_flow_summary(
+    state: str, totals: dict, amount_ratio: float | None, up_down_ratio: float | None, breadth: dict
+) -> str:
+    if not totals["sample_size"]:
+        return "资金趋势：样本不足，暂不判断主力进退。"
+    ratio_text = f"{amount_ratio:.2f}x" if amount_ratio is not None else "未知"
+    ud_text = f"{up_down_ratio:.2f}x" if up_down_ratio is not None else "无下跌成交额"
+    breadth_delta = breadth.get("delta_pct") if breadth else None
+    breadth_text = f"，广度变化 {float(breadth_delta):+.1f}pct" if breadth_delta is not None else ""
+    total_yi = float(totals["total_amount"]) / 1e8
+    return f"{state}：全市场成交额 {total_yi:.0f}亿，为20日均额 {ratio_text}；上涨/下跌成交额 {ud_text}{breadth_text}。"
+
+
+def calc_market_money_flow(
+    df_map: dict[str, pd.DataFrame],
+    breadth: dict | None = None,
+    lookback: int = MONEY_FLOW_LOOKBACK,
+) -> dict:
+    """用全市场成交额扩张/收缩和涨跌成交额分布，推断资金进退趋势。"""
+    snapshots = [
+        item
+        for item in (_symbol_money_snapshot(df, max(int(lookback), 2)) for df in df_map.values())
+        if item is not None
+    ]
+    totals = _money_flow_totals(snapshots)
+    amount_ratio = _safe_ratio(float(totals["total_amount"]), float(totals["mean_amount"]))
+    amount_ratio_3_20 = _safe_ratio(float(totals["recent3_amount"]), float(totals["mean_amount"]))
+    amount_change_pct = _safe_ratio(float(totals["total_amount"]), float(totals["prev_total_amount"]))
+    up_down_ratio = _safe_ratio(float(totals["up_amount"]), float(totals["down_amount"]))
+    breadth_delta = breadth.get("delta_pct") if breadth else None
+    state = _classify_money_flow(amount_ratio, up_down_ratio, breadth_delta)
+    score = _money_flow_score(amount_ratio, float(totals["up_amount"]), float(totals["down_amount"]), breadth_delta)
+    trend = "entry" if score >= 20 else "retreat" if score <= -20 else "neutral"
+    return {
+        "state": state,
+        "trend": trend,
+        "score": score,
+        "sample_size": totals["sample_size"],
+        "total_amount_yi": round(float(totals["total_amount"]) / 1e8, 2),
+        "prev_total_amount_yi": round(float(totals["prev_total_amount"]) / 1e8, 2),
+        "amount_ratio_1_20": None if amount_ratio is None else round(amount_ratio, 3),
+        "amount_ratio_3_20": None if amount_ratio_3_20 is None else round(amount_ratio_3_20, 3),
+        "amount_change_pct": None if amount_change_pct is None else round((amount_change_pct - 1.0) * 100.0, 2),
+        "up_amount_yi": round(float(totals["up_amount"]) / 1e8, 2),
+        "down_amount_yi": round(float(totals["down_amount"]) / 1e8, 2),
+        "up_down_amount_ratio": None if up_down_ratio is None else round(up_down_ratio, 3),
+        "advancing_count": totals["advancing_count"],
+        "declining_count": totals["declining_count"],
+        "summary": _money_flow_summary(state, totals, amount_ratio, up_down_ratio, breadth or {}),
+    }
+
+
 def analyze_benchmark_and_tune_cfg(
     bench_df: pd.DataFrame | None,
     smallcap_df: pd.DataFrame | None,
     cfg: FunnelConfig,
     breadth: dict | None = None,
+    money_flow: dict | None = None,
 ) -> dict:
     """
     Step 0：大盘总闸
@@ -220,6 +364,7 @@ def analyze_benchmark_and_tune_cfg(
             "sample_size": 0,
             "ma_window": BREADTH_MA_WINDOW,
         },
+        "money_flow": money_flow or calc_market_money_flow({}, breadth),
     }
     close = None
     ma50 = None
@@ -467,6 +612,7 @@ def analyze_benchmark_and_tune_cfg(
                 "sample_size": breadth_sample,
                 "ma_window": BREADTH_MA_WINDOW,
             },
+            "money_flow": money_flow or context["money_flow"],
         }
     )
     return context

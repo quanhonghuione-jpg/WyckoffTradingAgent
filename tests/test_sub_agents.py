@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from copy import deepcopy
 
 from cli.sub_agents import (
@@ -88,8 +89,13 @@ def test_run_sub_agent_basic():
     )
 
     assert result["agent"] == "research"
+    assert result["status"] == "completed"
     assert "大盘水温偏暖" in result["result"]
     assert result["usage"]["output_tokens"] == 15
+    assert result["rounds"] == 1
+    assert result["tool_calls"] == []
+    assert not result["context_truncated"]
+    assert not result["result_truncated"]
 
 
 def test_run_sub_agent_with_tool_call():
@@ -120,5 +126,98 @@ def test_run_sub_agent_with_tool_call():
     )
 
     assert result["agent"] == "research"
+    assert result["status"] == "completed"
     assert "上证" in result["result"]
+    assert result["tool_calls"] == ["get_market_overview"]
     assert registry.calls[0]["name"] == "get_market_overview"
+
+
+def test_run_sub_agent_trims_large_context():
+    provider = ScriptedProvider([[{"type": "text_delta", "text": "收到"}]])
+    registry = StubToolRegistry()
+    small_context_agent = deepcopy(RESEARCH_AGENT)
+    object.__setattr__(small_context_agent, "context_budget_tokens", 80)
+    context = "最早唯一材料" + "早期材料" * 500 + "最新关键材料"
+
+    result = run_sub_agent(
+        small_context_agent,
+        task="整理材料",
+        context=context,
+        provider=provider,
+        registry=registry,
+    )
+
+    sent = provider.calls[0]["messages"][0]["content"]
+    assert result["context_truncated"]
+    assert "上下文已按预算裁剪" in sent
+    assert "最新关键材料" in sent
+    assert "最早唯一材料" not in sent
+
+
+def test_run_sub_agent_trims_large_result():
+    provider = ScriptedProvider([[{"type": "text_delta", "text": "A" * 200}]])
+    registry = StubToolRegistry()
+    small_result_agent = deepcopy(RESEARCH_AGENT)
+    object.__setattr__(small_result_agent, "result_budget_chars", 80)
+
+    result = run_sub_agent(
+        small_result_agent,
+        task="输出摘要",
+        context="",
+        provider=provider,
+        registry=registry,
+    )
+
+    assert result["status"] == "completed"
+    assert result["result_truncated"]
+    assert len(result["result"]) <= 80
+    assert "结果已按输出预算截断" in result["result"]
+
+
+def test_run_sub_agent_cancelled():
+    provider = ScriptedProvider(
+        [
+            [
+                {"type": "text_delta", "text": "开始分析"},
+                {"type": "usage", "input_tokens": 10, "output_tokens": 2},
+            ],
+        ]
+    )
+    registry = StubToolRegistry()
+
+    result = run_sub_agent(
+        RESEARCH_AGENT,
+        task="查看大盘水温",
+        context="",
+        provider=provider,
+        registry=registry,
+        cancel_check=lambda: True,
+    )
+
+    assert result["agent"] == "research"
+    assert result["status"] == "cancelled"
+    assert result["result"] == ""
+    assert "cancelled" in result["error"]
+
+
+def test_run_sub_agent_timeout():
+    def slow_round(_messages, _tools, _system_prompt):
+        time.sleep(1.2)
+        return [{"type": "text_delta", "text": "迟到的分析"}]
+
+    provider = ScriptedProvider([slow_round])
+    registry = StubToolRegistry()
+    expired_agent = deepcopy(RESEARCH_AGENT)
+    object.__setattr__(expired_agent, "timeout_seconds", 1)
+
+    result = run_sub_agent(
+        expired_agent,
+        task="查看大盘水温",
+        context="",
+        provider=provider,
+        registry=registry,
+    )
+
+    assert result["agent"] == "research"
+    assert result["status"] == "timeout"
+    assert "timeout" in result["error"]

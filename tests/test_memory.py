@@ -6,6 +6,7 @@ from cli.memory import (
     build_memory_context,
     extract_stock_codes,
     prepend_memory_context,
+    refresh_memory_layers,
     save_session_summary,
 )
 
@@ -116,6 +117,18 @@ class TestBuildMemoryContext:
         finally:
             _close_tmp_db(local_db)
 
+    def test_dedupes_pinned_preferences_from_hybrid_results(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            local_db.save_memory("preference", "不追涨", codes="000001")
+
+            context = build_memory_context("000001 不追涨")
+
+            assert context.count("不追涨") == 1
+            assert "# 用户画像" in context
+        finally:
+            _close_tmp_db(local_db)
+
     def test_prepends_memory_context_to_current_turn_only(self):
         message = prepend_memory_context("今天怎么看？", "<relevant-memories>\nA\n</relevant-memories>")
 
@@ -182,6 +195,34 @@ class TestSaveSessionSummary:
             memories = local_db.get_recent_memories(memory_type="preference", limit=10)
             assert saved == 1
             assert any(m["content"] == "新偏好" for m in memories)
+        finally:
+            _close_tmp_db(local_db)
+
+    def test_refresh_layers_is_incremental(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            local_db.save_memory("preference", "偏好一")
+            local_db.save_memory("decision", "决策一")
+            local_db.save_memory("preference", "偏好二")
+
+            provider = _Provider(["[画像] 用户偏好确认后再交易\n[场景] 有放量确认才加仓"])
+            assert refresh_memory_layers(provider) == 2
+            assert provider.outputs == []
+
+            same_source_provider = _Provider(["[画像] 不应再次调用"])
+            assert refresh_memory_layers(same_source_provider) == 0
+            assert same_source_provider.outputs == ["[画像] 不应再次调用"]
+
+            local_db.save_memory("decision", "决策二")
+            local_db.save_memory("preference", "偏好三")
+            two_new_provider = _Provider(["[画像] 不足三条新 L1 不调用"])
+            assert refresh_memory_layers(two_new_provider) == 0
+            assert two_new_provider.outputs == ["[画像] 不足三条新 L1 不调用"]
+
+            local_db.save_memory("decision", "决策三")
+            next_provider = _Provider(["[画像] 用户偏好等待确认\n[场景] 趋势确认后再执行"])
+            assert refresh_memory_layers(next_provider) == 2
+            assert next_provider.outputs == []
         finally:
             _close_tmp_db(local_db)
 

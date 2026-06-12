@@ -5,10 +5,10 @@ import argparse
 import pandas as pd
 import pytest
 
-from core.dynamic_policy import filter_triggers_by_registry, resolve_dynamic_candidate_policy
+from core.dynamic_policy import build_signal_weight_map, filter_triggers_by_registry, resolve_dynamic_candidate_policy
 from core.signal_confirmation import score_springboard_abc
 from core.signal_feedback import build_signal_observations, build_signal_registry_updates, summarize_signal_health
-from scripts.signal_feedback_job import _outcome_rows
+from scripts.signal_feedback_job import _default_registry_horizon, _outcome_rows
 
 
 class _FailingUpsertQuery:
@@ -154,6 +154,24 @@ def test_dynamic_policy_shifts_quota_toward_healthier_track():
 
     assert policy["quota_family"] == "NEUTRAL+DYNAMIC"
     assert policy["trend_quota"] > policy["accum_quota"]
+
+
+def test_dynamic_policy_uses_configured_feedback_horizon(monkeypatch):
+    monkeypatch.setenv("FUNNEL_DYNAMIC_POLICY_HORIZON", "5")
+    weights = build_signal_weight_map(
+        [
+            {"as_of_date": "2026-06-10", "horizon_days": 10, "signal_type": "lps", "weight_multiplier": 1.2},
+            {"as_of_date": "2026-06-10", "horizon_days": 5, "signal_type": "lps", "weight_multiplier": 0.4},
+        ]
+    )
+
+    assert weights["lps"] == 0.4
+
+
+def test_signal_feedback_registry_horizon_defaults_to_five(monkeypatch):
+    monkeypatch.delenv("SIGNAL_REGISTRY_HORIZON", raising=False)
+
+    assert _default_registry_horizon() == 5
 
 
 def test_registry_retires_after_repeated_decay():

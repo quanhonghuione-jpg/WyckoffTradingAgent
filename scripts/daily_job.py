@@ -252,6 +252,92 @@ def _mark_step3_recommendations(
         _log(f"推荐记录AI标记失败: {e}", logs_path)
 
 
+def _shadow_observation_inputs(step2_details: dict) -> tuple[dict[str, list[tuple[str, float]]], dict[str, str], dict]:
+    score_map = step2_details.get("shadow_score_map") or {}
+    triggers: dict[str, list[tuple[str, float]]] = {}
+    source_map: dict[str, str] = {}
+    for signal_type, source_key in (("shadow_added", "shadow_added"), ("shadow_removed", "shadow_removed")):
+        rows: list[tuple[str, float]] = []
+        for code in step2_details.get(signal_type, []) or []:
+            code_s = str(code).strip()
+            if not code_s:
+                continue
+            rows.append((code_s, float(score_map.get(code_s, 0.0) or 0.0)))
+            source_map[code_s] = source_key
+        if rows:
+            triggers[signal_type] = rows
+    return triggers, source_map, score_map
+
+
+def _observation_context(step2_details: dict) -> tuple[dict, dict, dict, dict, dict, dict, dict]:
+    metrics = step2_details.get("metrics", {}) or {}
+    return (
+        metrics,
+        step2_details.get("name_map", {}) or {},
+        step2_details.get("sector_map", {}) or {},
+        metrics.get("accum_stage_map", {}) or {},
+        metrics.get("layer2_channel_map", {}) or {},
+        metrics.get("latest_close_map", {}) or {},
+        step2_details.get("springboard_map") or _build_springboard_map(step2_details),
+    )
+
+
+def _signal_observation_source_map(step2_details: dict) -> dict[str, str]:
+    bypass_codes = {str(c).strip() for c in step2_details.get("l2_bypass_selected", []) if str(c).strip()}
+    strategic_codes = {str(c).strip() for c in step2_details.get("strategic_l2_bypass_selected", []) if str(c).strip()}
+    source_map = {code: "l2_bypass" for code in bypass_codes}
+    source_map.update({code: "strategic_l2_bypass" for code in strategic_codes})
+    return source_map
+
+
+def _build_signal_observation_rows(
+    step2_details: dict,
+    regime: str,
+    ai_codes: list[str],
+) -> list[dict]:
+    from core.signal_feedback import build_signal_observations
+
+    metrics, name_map, sector_map, stage_map, channel_map, close_map, springboard_map = _observation_context(
+        step2_details
+    )
+    return build_signal_observations(
+        _latest_trade_date_str(),
+        step2_details.get("review_triggers") or step2_details.get("triggers") or {},
+        regime=regime,
+        selected_for_ai=step2_details.get("selected_for_ai", []) or [],
+        ai_recommended=ai_codes,
+        name_map=name_map,
+        sector_map=sector_map,
+        score_map=step2_details.get("priority_score_map", {}) or {},
+        stage_map=stage_map,
+        channel_map=channel_map,
+        latest_close_map=close_map,
+        source_map=_signal_observation_source_map(step2_details),
+        springboard_map=springboard_map,
+    )
+
+
+def _build_shadow_observation_rows(step2_details: dict, regime: str) -> list[dict]:
+    from core.signal_feedback import build_signal_observations
+
+    shadow_triggers, shadow_source_map, shadow_score_map = _shadow_observation_inputs(step2_details)
+    if not shadow_triggers:
+        return []
+    _, name_map, sector_map, stage_map, channel_map, close_map, _ = _observation_context(step2_details)
+    return build_signal_observations(
+        _latest_trade_date_str(),
+        shadow_triggers,
+        regime=regime,
+        name_map=name_map,
+        sector_map=sector_map,
+        score_map=shadow_score_map,
+        stage_map=stage_map,
+        channel_map=channel_map,
+        latest_close_map=close_map,
+        source_map=shadow_source_map,
+    )
+
+
 def _persist_signal_observations(
     step2_details: dict,
     benchmark_context: dict,
@@ -266,32 +352,11 @@ def _persist_signal_observations(
         _log("预演模式: 跳过信号观察样本入库", logs_path)
         return True
     try:
-        from core.signal_feedback import build_signal_observations
         from integrations.supabase_signal_feedback import upsert_signal_observations
 
-        metrics = step2_details.get("metrics", {}) or {}
-        bypass_codes = {str(c).strip() for c in step2_details.get("l2_bypass_selected", []) if str(c).strip()}
-        strategic_bypass_codes = {
-            str(c).strip() for c in step2_details.get("strategic_l2_bypass_selected", []) if str(c).strip()
-        }
-        source_map = {code: "l2_bypass" for code in bypass_codes}
-        source_map.update({code: "strategic_l2_bypass" for code in strategic_bypass_codes})
-        springboard_map = step2_details.get("springboard_map") or _build_springboard_map(step2_details)
-        rows = build_signal_observations(
-            _latest_trade_date_str(),
-            step2_details.get("review_triggers") or step2_details.get("triggers") or {},
-            regime=str((benchmark_context or {}).get("regime") or "NEUTRAL"),
-            selected_for_ai=step2_details.get("selected_for_ai", []) or [],
-            ai_recommended=ai_codes,
-            name_map=step2_details.get("name_map", {}) or {},
-            sector_map=step2_details.get("sector_map", {}) or {},
-            score_map=step2_details.get("priority_score_map", {}) or {},
-            stage_map=metrics.get("accum_stage_map", {}) or {},
-            channel_map=metrics.get("layer2_channel_map", {}) or {},
-            latest_close_map=metrics.get("latest_close_map", {}) or {},
-            source_map=source_map,
-            springboard_map=springboard_map,
-        )
+        regime = str((benchmark_context or {}).get("regime") or "NEUTRAL")
+        rows = _build_signal_observation_rows(step2_details, regime, ai_codes)
+        rows.extend(_build_shadow_observation_rows(step2_details, regime))
         written = upsert_signal_observations(rows)
         _log(f"信号观察样本入库: rows={len(rows)}, written={written}", logs_path)
         return True
@@ -715,6 +780,11 @@ def main() -> int:
     if step2_ok and step2_details:
         _run_signal_confirmation(symbols_info, step2_details, benchmark_context, logs_path, dry_run=preview_only)
 
+    # Step2.7: 起跳板 A/B/C 量化评分。必须在推荐写库前执行，推荐表才能沉淀 AI 推荐时的结构组合。
+    if symbols_info and step2_details:
+        _scored = _run_springboard_scoring(symbols_info, step2_details)
+        _log(f"Step2.7 起跳板评分: scored={_scored}/{len(symbols_info)}", logs_path)
+
     # 形态复盘写库（按 recommend_date=最近交易日）
     if step2_ok and symbols_info:
         recommend_trade_date_int, recommendation_payload = _persist_recommendations(
@@ -722,11 +792,6 @@ def main() -> int:
             logs_path,
             dry_run=preview_only,
         )
-
-    # Step2.7: 起跳板 A/B/C 量化评分
-    if symbols_info and step2_details:
-        _scored = _run_springboard_scoring(symbols_info, step2_details)
-        _log(f"Step2.7 起跳板评分: scored={_scored}/{len(symbols_info)}", logs_path)
 
     # Step3: 批量研报（可降级：失败不影响 Funnel 成功）
     step3_ok = True

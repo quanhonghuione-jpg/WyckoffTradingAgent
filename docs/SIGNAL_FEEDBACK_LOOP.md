@@ -115,7 +115,8 @@ Shadow 模式不会影响真实推荐。它的价值是回答三个问题：
 
 1. 动态策略比静态策略多选了哪些股票？
 2. 动态策略会移除哪些原本会进 AI 的股票？
-3. 这些差异背后的 `signal_weights` 和 `registry_snapshot` 是否合理？
+3. `diff_added` 的后续收益/回撤是否长期好于 `diff_removed`？
+4. 这些差异背后的 `signal_weights` 和 `registry_snapshot` 是否合理？
 
 常用查询：
 
@@ -132,6 +133,11 @@ from signal_policy_shadow_runs
 order by trade_date desc
 limit 10;
 ```
+
+`strategy_attribution_report.py` 会把 shadow 差异和已有 `signal_outcomes` 关联到
+`shadow_diff_stats_json.outcome_stats`。只有当 `diff_added` 在多个周期的收益/回撤稳定好于
+`diff_removed`，并且 missing outcome 不高时，才考虑把 `FUNNEL_DYNAMIC_POLICY` 从 `shadow`
+切到 `on`。
 
 ## 和迭代策略的对应关系
 

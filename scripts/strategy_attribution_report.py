@@ -133,9 +133,67 @@ def _ranked(rows: list[dict[str, Any]], horizon: int, *, reverse: bool) -> list[
     return [{key: row.get(key) for key in keys} for row in ranked[:20]]
 
 
-def _shadow_stats(shadow_rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _outcome_by_code_date(
+    rows: list[dict[str, Any]], horizons: list[int]
+) -> dict[tuple[str, str, int], dict[str, Any]]:
+    outcome_map: dict[tuple[str, str, int], dict[str, Any]] = {}
+    valid_horizons = {int(h) for h in horizons}
+    for row in rows:
+        horizon = int(row.get("horizon_days") or 0)
+        if horizon not in valid_horizons or _num(row.get("return_pct")) is None:
+            continue
+        key = (str(row.get("trade_date") or "")[:10], str(row.get("code") or "").strip(), horizon)
+        outcome_map.setdefault(key, row)
+    return outcome_map
+
+
+def _shadow_side_stats(
+    shadow_rows: list[dict[str, Any]],
+    outcome_map: dict[tuple[str, str, int], dict[str, Any]],
+    *,
+    side: str,
+    horizon: int,
+) -> dict[str, Any]:
+    matched: list[dict[str, Any]] = []
+    total = 0
+    for row in shadow_rows:
+        trade_date = str(row.get("trade_date") or "")[:10]
+        for code in row.get(side) or []:
+            total += 1
+            outcome = outcome_map.get((trade_date, str(code).strip(), horizon))
+            if outcome:
+                matched.append(outcome)
+    stats = _stats(matched)
+    stats.update(
+        {
+            "shadow_candidates": total,
+            "matched_outcomes": stats.get("count", 0),
+            "missing_outcomes": max(total - int(stats.get("count", 0)), 0),
+        }
+    )
+    return stats
+
+
+def _shadow_outcome_stats(
+    shadow_rows: list[dict[str, Any]],
+    outcome_rows: list[dict[str, Any]],
+    horizons: list[int],
+) -> dict[str, Any]:
+    outcome_map = _outcome_by_code_date(outcome_rows, horizons)
+    return {
+        str(horizon): {
+            "added": _shadow_side_stats(shadow_rows, outcome_map, side="diff_added", horizon=horizon),
+            "removed": _shadow_side_stats(shadow_rows, outcome_map, side="diff_removed", horizon=horizon),
+        }
+        for horizon in horizons
+    }
+
+
+def _shadow_stats(
+    shadow_rows: list[dict[str, Any]], outcome_rows: list[dict[str, Any]], horizons: list[int]
+) -> dict[str, Any]:
     if not shadow_rows:
-        return {"count": 0}
+        return {"count": 0, "outcome_stats": {}}
     added = sum(len(r.get("diff_added") or []) for r in shadow_rows)
     removed = sum(len(r.get("diff_removed") or []) for r in shadow_rows)
     return {
@@ -143,6 +201,7 @@ def _shadow_stats(shadow_rows: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_added": round(added / len(shadow_rows), 2),
         "avg_removed": round(removed / len(shadow_rows), 2),
         "latest": shadow_rows[-1],
+        "outcome_stats": _shadow_outcome_stats(shadow_rows, outcome_rows, horizons),
     }
 
 
@@ -163,7 +222,7 @@ def build_report(client: Any, market: str, days: int, horizons: list[int]) -> di
         "summary_json": _group_stats(joined, "horizon_days", horizons),
         "signal_stats_json": _group_stats(joined, "signal_type", horizons),
         "score_bucket_stats_json": _score_bucket_stats(joined, horizons),
-        "shadow_diff_stats_json": _shadow_stats(shadow),
+        "shadow_diff_stats_json": _shadow_stats(shadow, joined, horizons),
         "top_winners_json": _ranked(joined, focus_horizon, reverse=True),
         "top_losers_json": _ranked(joined, focus_horizon, reverse=False),
         "recommendations_json": _recommendations(joined, horizons),
@@ -193,11 +252,20 @@ def _write_artifacts(report: dict[str, Any], output_dir: str) -> None:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    shadow = report.get("shadow_diff_stats_json") or {}
+    shadow_h5 = ((shadow.get("outcome_stats") or {}).get("5") or {}) if isinstance(shadow, dict) else {}
     lines = [
         f"# 策略归因报告 {report['report_date']}",
         "",
         f"- 市场: `{report['market']}`",
         f"- 窗口: `{report['window_start']}` 至 `{report['window_end']}`",
+        "",
+        "## Shadow 差异",
+        f"- run 数: `{shadow.get('count', 0) if isinstance(shadow, dict) else 0}`",
+        f"- 平均新增: `{shadow.get('avg_added', 0) if isinstance(shadow, dict) else 0}`",
+        f"- 平均移除: `{shadow.get('avg_removed', 0) if isinstance(shadow, dict) else 0}`",
+        f"- h=5 新增组: `{json.dumps(shadow_h5.get('added') or {}, ensure_ascii=False)}`",
+        f"- h=5 移除组: `{json.dumps(shadow_h5.get('removed') or {}, ensure_ascii=False)}`",
     ]
     lines += [
         "",

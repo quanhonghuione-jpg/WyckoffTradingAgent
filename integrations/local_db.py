@@ -745,12 +745,13 @@ def save_memory(
             (memory_type, content, codes),
         ).fetchone()
         if existing:
-            if source_ref:
+            if source_ref or metadata_text:
                 conn.execute(
                     """UPDATE agent_memory
-                       SET source_ref = CASE WHEN source_ref='' THEN ? ELSE source_ref END
+                       SET source_ref = CASE WHEN ?!='' AND source_ref='' THEN ? ELSE source_ref END,
+                           metadata = CASE WHEN ?!='' THEN ? ELSE metadata END
                        WHERE id=?""",
-                    (source_ref, existing["id"]),
+                    (source_ref, source_ref, metadata_text, metadata_text, existing["id"]),
                 )
             return int(existing["id"])
         cur = conn.execute(

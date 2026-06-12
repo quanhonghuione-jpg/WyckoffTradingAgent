@@ -1851,6 +1851,7 @@ class WyckoffTUI(App):
                     _scroll()
 
             self._tools._tool_context.on_progress = _on_sub_agent_progress
+            self._tools._tool_context.cancel_check = self._cancel_event.is_set
 
             runtime = AgentRuntime(
                 self._provider, self._tools, scratchpad=_scratchpad, cancel_check=self._cancel_event.is_set

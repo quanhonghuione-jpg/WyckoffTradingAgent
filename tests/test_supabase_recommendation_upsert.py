@@ -102,6 +102,13 @@ def test_upsert_recommendations_dedupes_same_code_same_date(monkeypatch):
                 "selection_source": "l4_hit",
                 "priority_rank": 1,
                 "market_regime": "PANIC_REPAIR",
+                "springboard_a": True,
+                "springboard_b": True,
+                "springboard_c": False,
+                "springboard_combo": "A+B",
+                "springboard_met_count": 2,
+                "springboard_evidence": {"a_hits": [{"date": "2026-05-18"}]},
+                "springboard_scored": True,
             },
         ],
     )
@@ -115,6 +122,9 @@ def test_upsert_recommendations_dedupes_same_code_same_date(monkeypatch):
     assert client.upserts[0][0]["selection_source"] == "l4_hit"
     assert client.upserts[0][0]["selection_rank"] == 1
     assert client.upserts[0][0]["market_regime"] == "PANIC_REPAIR"
+    assert client.upserts[0][0]["springboard_combo"] == "A+B"
+    assert client.upserts[0][0]["springboard_met_count"] == 2
+    assert client.upserts[0][0]["springboard_evidence"]["a_hits"][0]["date"] == "2026-05-18"
 
 
 def test_upsert_recommendations_writes_large_payload_in_chunks(monkeypatch):
@@ -145,6 +155,13 @@ def test_write_recommendation_backup_artifact_marks_ai_and_sql(tmp_path):
             "signal_types": ["sos", "lps"],
             "selection_source": "l4_hit",
             "market_regime": "PANIC_REPAIR",
+            "springboard_a": True,
+            "springboard_b": False,
+            "springboard_c": True,
+            "springboard_combo": "A+C",
+            "springboard_met_count": 2,
+            "springboard_evidence": {"c_support": {"touch_dates": ["2026-05-24"]}},
+            "springboard_scored": True,
             "updated_at": "2026-05-26T10:00:00+00:00",
         }
     ]
@@ -160,4 +177,5 @@ def test_write_recommendation_backup_artifact_marks_ai_and_sql(tmp_path):
     assert "insert into public.recommendation_tracking" in sql
     assert "on conflict (code, recommend_date) do update set" in sql
     assert "array['sos', 'lps']::text[]" in sql
+    assert '\'{"c_support": {"touch_dates": ["2026-05-24"]}}\'::jsonb' in sql
     assert "'O''Reilly setup'" in sql

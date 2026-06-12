@@ -48,6 +48,16 @@ RECOMMENDATION_ATTRIBUTION_COLUMNS = (
     "strategic_stock_score",
     "strategic_theme_state",
     "strategic_theme_bonus",
+    "springboard_a",
+    "springboard_b",
+    "springboard_c",
+    "springboard_combo",
+    "springboard_grade",
+    "springboard_met_count",
+    "springboard_support",
+    "springboard_touch_count",
+    "springboard_evidence",
+    "springboard_scored",
 )
 RECOMMENDATION_OPTIONAL_COLUMNS = (
     "is_ai_recommended",
@@ -396,6 +406,32 @@ def _optional_text_list(raw: Any) -> list[str]:
     return [text for item in values if (text := str(item or "").strip())]
 
 
+def _optional_json(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return value if isinstance(value, dict) else {}
+    return {}
+
+
+def _springboard_combo(row: dict[str, Any]) -> str:
+    combo = _optional_text(row.get("springboard_combo")) or _optional_text(row.get("springboard_grade"))
+    if combo:
+        return combo
+    parts = [
+        name
+        for name, key in (("A", "springboard_a"), ("B", "springboard_b"), ("C", "springboard_c"))
+        if _optional_bool(row.get(key))
+    ]
+    return "+".join(parts) if parts else "none"
+
+
 def _extract_recommendation_attribution(row: dict[str, Any]) -> dict[str, Any]:
     signal_types = _optional_text_list(row.get("signal_types"))
     primary_signal = _optional_text(row.get("primary_signal")) or (signal_types[0] if signal_types else None)
@@ -423,6 +459,16 @@ def _extract_recommendation_attribution(row: dict[str, Any]) -> dict[str, Any]:
         "strategic_stock_score": _optional_float(row.get("strategic_stock_score")),
         "strategic_theme_state": _optional_text(row.get("strategic_theme_state")),
         "strategic_theme_bonus": _optional_float(row.get("strategic_theme_bonus")),
+        "springboard_a": _optional_bool(row.get("springboard_a")) or False,
+        "springboard_b": _optional_bool(row.get("springboard_b")) or False,
+        "springboard_c": _optional_bool(row.get("springboard_c")) or False,
+        "springboard_combo": _springboard_combo(row),
+        "springboard_grade": _optional_text(row.get("springboard_grade")) or _springboard_combo(row),
+        "springboard_met_count": _optional_int(row.get("springboard_met_count")) or 0,
+        "springboard_support": _optional_float(row.get("springboard_support")),
+        "springboard_touch_count": _optional_int(row.get("springboard_touch_count")) or 0,
+        "springboard_evidence": _optional_json(row.get("springboard_evidence")),
+        "springboard_scored": _optional_bool(row.get("springboard_scored")) or False,
     }
 
 
@@ -432,6 +478,8 @@ def _is_missing_payload_value(value: Any) -> bool:
     if isinstance(value, str):
         return not value.strip()
     if isinstance(value, list | tuple | set):
+        return len(value) == 0
+    if isinstance(value, dict):
         return len(value) == 0
     return False
 
@@ -569,6 +617,8 @@ def _clean_backup_value(value: Any) -> Any:
         return None
     if isinstance(value, list | tuple | set):
         return [cleaned for item in value if (cleaned := _clean_backup_value(item)) is not None]
+    if isinstance(value, dict):
+        return {str(key): cleaned for key, item in value.items() if (cleaned := _clean_backup_value(item)) is not None}
     try:
         if pd.isna(value):
             return None
@@ -598,6 +648,8 @@ def _sql_literal(value: Any) -> str:
         if not value:
             return "'{}'::text[]"
         return "array[" + ", ".join(_sql_literal(str(item)) for item in value) + "]::text[]"
+    if isinstance(value, dict):
+        return "'" + json.dumps(value, ensure_ascii=False).replace("'", "''") + "'::jsonb"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int | float):

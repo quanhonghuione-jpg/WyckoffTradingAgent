@@ -123,6 +123,22 @@ def test_signal_confirmation_dry_run_does_not_write(monkeypatch):
     assert writes == []
 
 
+def test_shadow_observation_inputs_build_added_and_removed_sources():
+    import scripts.daily_job as daily_job
+
+    triggers, source_map, score_map = daily_job._shadow_observation_inputs(
+        {
+            "shadow_added": ["000001"],
+            "shadow_removed": ["000002"],
+            "shadow_score_map": {"000001": 3.5, "000002": 1.2},
+        }
+    )
+
+    assert triggers == {"shadow_added": [("000001", 3.5)], "shadow_removed": [("000002", 1.2)]}
+    assert source_map == {"000001": "shadow_added", "000002": "shadow_removed"}
+    assert score_map["000001"] == 3.5
+
+
 def test_persist_signal_observations_reports_write_failure(monkeypatch):
     import integrations.supabase_signal_feedback as signal_feedback
     import scripts.daily_job as daily_job

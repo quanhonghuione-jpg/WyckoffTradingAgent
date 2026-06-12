@@ -20,14 +20,16 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 # Ensure project root is on sys.path for direct script invocation
 if __name__ == "__main__" or not __package__:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core.cash_portfolio import CashPortfolioConfig, simulate_cash_portfolio
 from core.funnel_pipeline import (
     analyze_benchmark_and_tune_cfg as _tune_cfg_by_regime,
 )
@@ -71,6 +73,14 @@ DEFAULT_SELL_FRICTION_PCT = float(os.getenv("BACKTEST_SELL_FRICTION_PCT", "0.5")
 DEFAULT_METRICS_ENGINE = os.getenv("BACKTEST_METRICS_ENGINE", "legacy").strip().lower() or "legacy"
 DEFAULT_WBT_FEE_RATE = float(os.getenv("BACKTEST_WBT_FEE_RATE", "0.0"))
 DEFAULT_WBT_N_JOBS = int(os.getenv("BACKTEST_WBT_N_JOBS", "1"))
+DEFAULT_CASH_PORTFOLIO_INITIAL_CASH = 100_000.0
+DEFAULT_CASH_PORTFOLIO_MAX_POSITIONS = 4
+DEFAULT_CASH_PORTFOLIO_COMMISSION_RATE = 0.0002
+DEFAULT_CASH_PORTFOLIO_SMALL_TRADE_THRESHOLD = 10_000.0
+DEFAULT_CASH_PORTFOLIO_SMALL_TRADE_FEE = 5.0
+DEFAULT_CASH_PORTFOLIO_LOT_SIZE = 100
+DEFAULT_ENTRY_PRICE_TIME = "14:55"
+CN_ZONE = ZoneInfo("Asia/Shanghai")
 
 # ── 大盘水温仓位控制：根据 regime 调节每日候选上限，减少逆势开仓。 ──
 REGIME_POSITION_RATIO: dict[str, float] = {
@@ -103,6 +113,8 @@ class TradeRecord:
     ret_pct: float
     track: str = ""  # "Trend" / "Accum" / "" (unclassified)
     regime: str = ""  # market regime at signal time
+    entry_price_source: str = "daily_open"
+    entry_target_time: str = ""
 
 
 def _parse_date(v: str) -> date:
@@ -497,6 +509,101 @@ def _open_on_or_after(df: pd.DataFrame, d: date, *, skip_limit_up: bool = True) 
     return None, None
 
 
+def _parse_entry_time(raw: str) -> time:
+    try:
+        hour_s, minute_s = str(raw or DEFAULT_ENTRY_PRICE_TIME).strip().split(":", 1)
+        return time(hour=int(hour_s), minute=int(minute_s))
+    except (TypeError, ValueError):
+        return time(hour=14, minute=55)
+
+
+def _intraday_ms_window(day: date, entry_time: str) -> tuple[int, int]:
+    target = _parse_entry_time(entry_time)
+    start_dt = datetime.combine(day, time(hour=9, minute=30), tzinfo=CN_ZONE)
+    end_dt = datetime.combine(day, target, tzinfo=CN_ZONE) + timedelta(minutes=1)
+    return int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
+
+
+def _price_at_or_before(df: pd.DataFrame, day: date, entry_time: str) -> float | None:
+    if df is None or df.empty or "close" not in df.columns:
+        return None
+    work = df.copy()
+    if "datetime" in work.columns:
+        dt = pd.to_datetime(work["datetime"], errors="coerce")
+    elif "timestamp" in work.columns:
+        dt = pd.to_datetime(work["timestamp"], unit="ms", utc=True, errors="coerce").dt.tz_convert(CN_ZONE)
+    else:
+        return None
+    work["datetime"] = dt
+    work["close"] = pd.to_numeric(work["close"], errors="coerce")
+    target = datetime.combine(day, _parse_entry_time(entry_time), tzinfo=CN_ZONE)
+    hit = work[(work["datetime"].dt.date == day) & (work["datetime"] <= target)].dropna(subset=["close"]).tail(1)
+    return None if hit.empty else float(hit.iloc[0]["close"])
+
+
+def _resolve_tickflow_entry_price(
+    code: str,
+    day: date,
+    entry_time: str,
+    cache: dict,
+) -> float | None:
+    key = (str(code), day, str(entry_time))
+    if key in cache:
+        return cache[key]
+    api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
+    if not api_key:
+        cache[key] = None
+        return None
+    from integrations.tickflow_client import TickFlowClient
+
+    client = cache.get("_client")
+    if client is None:
+        client = TickFlowClient(api_key=api_key)
+        cache["_client"] = client
+    start_ms, end_ms = _intraday_ms_window(day, entry_time)
+    try:
+        df = client.get_klines(
+            code,
+            period="1m",
+            count=500,
+            intraday=True,
+            start_time_ms=start_ms,
+            end_time_ms=end_ms,
+        )
+        cache[key] = _price_at_or_before(df, day, entry_time)
+    except Exception as exc:
+        logger.warning("TickFlow %s %s %s 分钟入场价失败，回退日线收盘: %s", code, day, entry_time, exc)
+        cache[key] = None
+    return cache[key]
+
+
+def _entry_on_or_after(
+    df: pd.DataFrame,
+    code: str,
+    d: date,
+    *,
+    mode: str,
+    entry_time: str,
+    intraday_cache: dict,
+    skip_limit_up: bool = True,
+) -> tuple[float | None, date | None, str]:
+    candidates = df[df["date"] >= d].head(5)
+    for _, row_s in candidates.iterrows():
+        if skip_limit_up and _is_limit_up_locked(row_s):
+            continue
+        hit_date = row_s["date"]
+        if mode == "tail_1455":
+            price = _resolve_tickflow_entry_price(code, hit_date, entry_time, intraday_cache)
+            if price is not None and price > 0:
+                return price, hit_date, f"tickflow_1m_{entry_time}"
+            close_v = pd.to_numeric(pd.Series([row_s.get("close")]), errors="coerce").dropna()
+            if not close_v.empty:
+                return float(close_v.iloc[0]), hit_date, "daily_close_fallback"
+        price, entry_date = _open_on_or_after(df, hit_date, skip_limit_up=False)
+        return price, entry_date, "daily_open"
+    return None, None, ""
+
+
 def _close_on_or_before(
     df: pd.DataFrame,
     d: date,
@@ -633,10 +740,22 @@ def run_backtest(
     wbt_fee_rate: float = DEFAULT_WBT_FEE_RATE,
     wbt_n_jobs: int = DEFAULT_WBT_N_JOBS,
     abc_filter: bool = False,
+    entry_price_mode: str = "open",
+    entry_price_time: str = DEFAULT_ENTRY_PRICE_TIME,
+    cash_portfolio: bool = False,
+    initial_cash: float = DEFAULT_CASH_PORTFOLIO_INITIAL_CASH,
+    max_positions: int = DEFAULT_CASH_PORTFOLIO_MAX_POSITIONS,
+    commission_rate: float = DEFAULT_CASH_PORTFOLIO_COMMISSION_RATE,
+    small_trade_threshold: float = DEFAULT_CASH_PORTFOLIO_SMALL_TRADE_THRESHOLD,
+    small_trade_fee: float = DEFAULT_CASH_PORTFOLIO_SMALL_TRADE_FEE,
+    lot_size: int = DEFAULT_CASH_PORTFOLIO_LOT_SIZE,
 ) -> tuple[pd.DataFrame, dict]:
     metrics_engine = str(metrics_engine or "legacy").strip().lower()
+    entry_price_mode = str(entry_price_mode or "open").strip().lower()
     if metrics_engine not in {"legacy", "auto", "both", "wbt"}:
         raise ValueError("metrics_engine 必须是 legacy / auto / both / wbt")
+    if entry_price_mode not in {"open", "tail_1455"}:
+        raise ValueError("entry_price_mode 必须是 open 或 tail_1455")
     if pending_mode not in {"off", "only", "both"}:
         raise ValueError("pending_mode 必须是 off / only / both")
     if pending_merge_order not in {"funnel_first", "confirmed_first"}:
@@ -665,6 +784,14 @@ def run_backtest(
         raise ValueError("wbt_fee_rate 必须 >= 0")
     if wbt_n_jobs < 1:
         raise ValueError("wbt_n_jobs 必须 >= 1")
+    if initial_cash <= 0:
+        raise ValueError("initial_cash 必须 > 0")
+    if max_positions < 1:
+        raise ValueError("max_positions 必须 >= 1")
+    if commission_rate < 0 or small_trade_threshold < 0 or small_trade_fee < 0:
+        raise ValueError("commission_rate / small_trade_threshold / small_trade_fee 必须 >= 0")
+    if lot_size < 1:
+        raise ValueError("lot_size 必须 >= 1")
 
     # ── 快照模式：优先从快照加载股票列表，避免网络调用 ──
     snapshot_name_map: dict[str, str] | None = None
@@ -772,6 +899,7 @@ def run_backtest(
     signal_days = 0
     eval_days = 0
     ohlc_lookup_cache: dict[str, dict[date, tuple[float, float, float, float]]] = {}
+    intraday_entry_cache: dict = {}
 
     pending_pool = PendingPool() if pending_mode != "off" else None
     pending_confirmed_total = 0
@@ -891,8 +1019,14 @@ def run_backtest(
                 continue
             # 核心修正：实盘中信号出现在收盘后，最早只能在次日开盘买入
             # 停牌股可能延后成交，必须用 actual_entry_date 计算持有窗口
-            entry_close, actual_entry_date = _open_on_or_after(
-                full_df, entry_target_date, skip_limit_up=(board != "us")
+            entry_close, actual_entry_date, entry_price_source = _entry_on_or_after(
+                full_df,
+                code,
+                entry_target_date,
+                mode=entry_price_mode,
+                entry_time=entry_price_time,
+                intraday_cache=intraday_entry_cache,
+                skip_limit_up=(board != "us"),
             )
             if entry_close is None or entry_close <= 0 or actual_entry_date is None:
                 continue
@@ -1106,6 +1240,8 @@ def run_backtest(
                     ret_pct=ret_pct,
                     track=track_map.get(code, ""),
                     regime=regime,
+                    entry_price_source=entry_price_source,
+                    entry_target_time=entry_price_time if entry_price_mode == "tail_1455" else "",
                 )
             )
 
@@ -1147,6 +1283,13 @@ def run_backtest(
         "pending_mode": pending_mode,
         "pending_merge_order": pending_merge_order,
         "pending_confirmed_total": pending_confirmed_total,
+        "entry_price_mode": entry_price_mode,
+        "entry_price_time": entry_price_time if entry_price_mode == "tail_1455" else "",
+        "cash_portfolio_enabled": bool(cash_portfolio),
+        "cash_portfolio_commission_rate": float(commission_rate),
+        "cash_portfolio_small_trade_threshold": float(small_trade_threshold),
+        "cash_portfolio_small_trade_fee": float(small_trade_fee),
+        "cash_portfolio_lot_size": int(lot_size),
         "metrics_engine": metrics_engine,
         "wbt_fee_rate": float(wbt_fee_rate),
         "wbt_n_jobs": int(wbt_n_jobs),
@@ -1247,6 +1390,21 @@ def run_backtest(
                 "wbt_error": "no trades" if metrics_engine in {"auto", "both", "wbt"} else "",
             }
         )
+    if cash_portfolio:
+        cash_trades_df, cash_nav_df, cash_summary = simulate_cash_portfolio(
+            trades_df,
+            CashPortfolioConfig(
+                initial_cash=initial_cash,
+                max_positions=max_positions,
+                commission_rate=commission_rate,
+                small_trade_threshold=small_trade_threshold,
+                small_trade_fee=small_trade_fee,
+                lot_size=lot_size,
+            ),
+        )
+        summary.update(cash_summary)
+        summary["_cash_portfolio_trades_df"] = cash_trades_df
+        summary["_cash_portfolio_nav_df"] = cash_nav_df
     return trades_df, summary
 
 
@@ -1676,10 +1834,21 @@ def _build_summary_md(summary: dict) -> str:
         if use_current_meta
         else "disabled_current_snapshot_filters (bias-reduced)"
     )
+    entry_mode = str(summary.get("entry_price_mode") or "open")
+    entry_desc = "T+1 14:55 分钟线价格买入" if entry_mode == "tail_1455" else "T+1 开盘价买入"
+    cost_note = (
+        "- 现金账户口径：买卖双边佣金率 "
+        f"{_fmt_metric(float(summary.get('cash_portfolio_commission_rate') or 0) * 10000, 2)} / 万，"
+        "单笔成交额低于 "
+        f"{_fmt_metric(summary.get('cash_portfolio_small_trade_threshold'), 2)} 元时收 "
+        f"{_fmt_metric(summary.get('cash_portfolio_small_trade_fee'), 2)} 元。"
+        if summary.get("cash_portfolio_enabled")
+        else "- 已纳入双边摩擦成本（各0.5%）；累计收益走单利（cumsum）口径，不放大噪声，便于策略横向比较。"
+    )
     notes = [
         "- 该回测使用日线数据（qfq），含 T+1 与涨跌停成交约束（一字板不可成交）。",
-        "- 入场口径：信号日收盘后出信号，次日开盘价买入（跳过一字涨停日）。",
-        "- 已纳入双边摩擦成本（各0.5%）；累计收益走单利（cumsum）口径，不放大噪声，便于策略横向比较。",
+        f"- 入场口径：信号日收盘后出信号，{entry_desc}（跳过一字涨停日）。",
+        cost_note,
         "- ⚠️ 仍存在幸存者偏差：股票池来自当前在市样本，未包含历史退市股票。",
     ]
     if use_current_meta:
@@ -1733,6 +1902,8 @@ def _build_summary_md(summary: dict) -> str:
         f"- 元数据口径: {meta_mode}",
         f"- 信号确认模式: {summary.get('pending_mode')}",
         f"- 大盘水温仓控: {'开启' if summary.get('regime_filter') else '关闭'}",
+        f"- 入场价格模式: {summary.get('entry_price_mode')}"
+        + (f" @ {summary.get('entry_price_time')}" if summary.get("entry_price_time") else ""),
         f"- 绩效引擎: {summary.get('metrics_engine', 'legacy')}"
         + (
             "（wbt 可用）"
@@ -1756,6 +1927,23 @@ def _build_summary_md(summary: dict) -> str:
         f"- 组合总收益: {_fmt_metric(summary.get('portfolio_total_ret_pct'), 2)}%",
         f"- 平均持仓数: {_fmt_metric(summary.get('portfolio_avg_positions'), 1)}",
         "",
+        *(
+            [
+                "## 真实现金账户模拟",
+                f"- 初始现金: {_fmt_metric(summary.get('cash_portfolio_initial_cash'), 2)}",
+                f"- 最多持仓: {_fmt_metric(summary.get('cash_portfolio_max_positions'), 0)}",
+                f"- 最终现金: {_fmt_metric(summary.get('cash_portfolio_final_cash'), 2)}",
+                f"- 总收益: {_fmt_metric(summary.get('cash_portfolio_total_return_pct'), 2)}%",
+                f"- 成交笔数: {_fmt_metric(summary.get('cash_portfolio_trades'), 0)}",
+                f"- 胜率: {_fmt_metric(summary.get('cash_portfolio_win_rate_pct'), 2)}%",
+                f"- 平均盈利: {_fmt_metric(summary.get('cash_portfolio_avg_profit_pct'), 3)}%",
+                f"- 平均亏损: {_fmt_metric(summary.get('cash_portfolio_avg_loss_pct'), 3)}%",
+                f"- 佣金合计: {_fmt_metric(summary.get('cash_portfolio_commission_total'), 2)}",
+                "",
+            ]
+            if summary.get("cash_portfolio_enabled")
+            else []
+        ),
         *(
             [
                 "## wbt 权重回测辅助指标",
@@ -2002,6 +2190,39 @@ def main() -> int:
         default=False,
         help="启用 ABC 起跳板过滤：仅保留满足 >=2 条件的候选（更严格的信号质量门槛）",
     )
+    parser.add_argument(
+        "--entry-price-mode",
+        choices=["open", "tail_1455"],
+        default="open",
+        help="入场成交价: open=T+1开盘；tail_1455=T+1 14:55 分钟线价",
+    )
+    parser.add_argument(
+        "--entry-price-time",
+        default=DEFAULT_ENTRY_PRICE_TIME,
+        help=f"tail_1455 模式下的目标分钟时间 (default: {DEFAULT_ENTRY_PRICE_TIME})",
+    )
+    parser.add_argument(
+        "--cash-portfolio",
+        action="store_true",
+        default=False,
+        help="启用真实现金账户模拟：初始现金、最多持仓、卖出后补位、100股一手",
+    )
+    parser.add_argument("--initial-cash", type=float, default=DEFAULT_CASH_PORTFOLIO_INITIAL_CASH)
+    parser.add_argument("--max-positions", type=int, default=DEFAULT_CASH_PORTFOLIO_MAX_POSITIONS)
+    parser.add_argument("--commission-rate", type=float, default=DEFAULT_CASH_PORTFOLIO_COMMISSION_RATE)
+    parser.add_argument(
+        "--small-trade-threshold",
+        type=float,
+        default=DEFAULT_CASH_PORTFOLIO_SMALL_TRADE_THRESHOLD,
+        help="现金账户手续费小额成交阈值；成交额低于该值时收 small-trade-fee",
+    )
+    parser.add_argument(
+        "--small-trade-fee",
+        type=float,
+        default=DEFAULT_CASH_PORTFOLIO_SMALL_TRADE_FEE,
+        help="现金账户小额成交固定手续费",
+    )
+    parser.add_argument("--lot-size", type=int, default=DEFAULT_CASH_PORTFOLIO_LOT_SIZE)
     args = parser.parse_args()
 
     start_dt = _parse_date(args.start)
@@ -2048,6 +2269,15 @@ def main() -> int:
                 wbt_fee_rate=args.wbt_fee_rate,
                 wbt_n_jobs=args.wbt_n_jobs,
                 abc_filter=args.abc_filter,
+                entry_price_mode=args.entry_price_mode,
+                entry_price_time=args.entry_price_time,
+                cash_portfolio=args.cash_portfolio,
+                initial_cash=args.initial_cash,
+                max_positions=args.max_positions,
+                commission_rate=args.commission_rate,
+                small_trade_threshold=args.small_trade_threshold,
+                small_trade_fee=args.small_trade_fee,
+                lot_size=args.lot_size,
             )
         except Exception as exc:
             last_error = exc
@@ -2062,6 +2292,8 @@ def main() -> int:
                     "median_ret_pct": None,
                     "max_drawdown_pct": None,
                     "sharpe_ratio": None,
+                    "cash_final": None,
+                    "cash_win_rate_pct": None,
                     "error": err_msg,
                 }
             )
@@ -2079,6 +2311,18 @@ def main() -> int:
             nav_path = out_dir / f"nav_{stamp}.csv"
             nav_df.to_csv(nav_path, index=False, encoding="utf-8-sig")
             logger.info("nav     -> %s", nav_path)
+
+        cash_trades_df = summary.pop("_cash_portfolio_trades_df", None)
+        if cash_trades_df is not None and not cash_trades_df.empty:
+            cash_trades_path = out_dir / f"cash_trades_{stamp}.csv"
+            cash_trades_df.to_csv(cash_trades_path, index=False, encoding="utf-8-sig")
+            logger.info("cash trades -> %s", cash_trades_path)
+
+        cash_nav_df = summary.pop("_cash_portfolio_nav_df", None)
+        if cash_nav_df is not None and not cash_nav_df.empty:
+            cash_nav_path = out_dir / f"cash_nav_{stamp}.csv"
+            cash_nav_df.to_csv(cash_nav_path, index=False, encoding="utf-8-sig")
+            logger.info("cash nav -> %s", cash_nav_path)
 
         wbt_weight_df = summary.pop("_wbt_weight_df", None)
         if wbt_weight_df is not None and not wbt_weight_df.empty:
@@ -2119,6 +2363,8 @@ def main() -> int:
                 "median_ret_pct": summary.get("median_ret_pct"),
                 "max_drawdown_pct": summary.get("max_drawdown_pct"),
                 "sharpe_ratio": summary.get("sharpe_ratio"),
+                "cash_final": summary.get("cash_portfolio_final_cash"),
+                "cash_win_rate_pct": summary.get("cash_portfolio_win_rate_pct"),
                 "error": "",
             }
         )
@@ -2141,8 +2387,8 @@ def main() -> int:
             f"- 持有周期: {', '.join(str(x['hold_days']) for x in suite_rows)}",
             f"- 成功周期数: {success_count}/{len(suite_rows)}",
             "",
-            "| 持有天数 | 成交笔数 | 胜率(%) | 平均收益(%) | 中位收益(%) | 最大回撤(%) | 夏普比 | 备注 |",
-            "|---:|---:|---:|---:|---:|---:|---:|---|",
+            "| 持有天数 | 成交笔数 | 胜率(%) | 平均收益(%) | 中位收益(%) | 最大回撤(%) | 夏普比 | 现金终值 | 现金胜率(%) | 备注 |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
         ]
         for row in suite_df.to_dict(orient="records"):
             md_lines.append(
@@ -2153,6 +2399,8 @@ def main() -> int:
                 f"{_fmt_metric(row.get('median_ret_pct'), 3)} | "
                 f"{_fmt_metric(row.get('max_drawdown_pct'), 3)} | "
                 f"{_fmt_metric(row.get('sharpe_ratio'), 3)} | "
+                f"{_fmt_metric(row.get('cash_final'), 2)} | "
+                f"{_fmt_metric(row.get('cash_win_rate_pct'), 2)} | "
                 f"{str(row.get('error', '') or '').replace('|', '/')} |"
             )
         suite_md.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
