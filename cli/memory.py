@@ -5,7 +5,6 @@ Agent 跨会话记忆 — 会话摘要提取 + 记忆注入。
 from __future__ import annotations
 
 import logging
-import os
 import re
 from hashlib import sha256
 from json import dumps, loads
@@ -74,7 +73,6 @@ _LAYER_MIN_ATOMS = 3
 _LAYER_VERSION = 2
 _LAYER_NEW_ATOMS_THRESHOLD = 3
 _SESSION_SUMMARY_VERSION = 2
-_LLM_DEDUP_ENV = "WYCKOFF_MEMORY_LLM_DEDUP"
 
 
 def extract_stock_codes(text: str) -> list[str]:
@@ -227,10 +225,6 @@ def _find_deterministic_duplicate(content: str, existing: list[dict]) -> int | N
     return None
 
 
-def _llm_dedup_enabled() -> bool:
-    return os.getenv(_LLM_DEDUP_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _get_dedup_provider() -> Any | None:
     """获取去重用的 provider：优先 fallback，其次 main。"""
     try:
@@ -260,18 +254,22 @@ def _find_duplicate(memory_type: str, content: str, provider: Any | None) -> int
     if duplicate_id:
         return duplicate_id
     if provider is None:
-        return None
+        raise RuntimeError("memory dedup provider unavailable")
     lines = [f"#{m['id']}: {m['content']}" for m in existing]
     user_text = "已有记忆:\n" + "\n".join(lines) + f"\n\n新记忆:\n{content}"
     result = _provider_text(provider, user_text, _DEDUP_PROMPT).strip()
+    if result == "NEW":
+        return None
     match = re.match(r"DUPLICATE[:\s]*#?(\d+)", result)
     if not match:
-        return None
+        raise ValueError("invalid memory dedup response")
     duplicate_id = int(match.group(1))
-    return duplicate_id if any(m["id"] == duplicate_id for m in existing) else None
+    if any(m["id"] == duplicate_id for m in existing):
+        return duplicate_id
+    raise ValueError("dedup duplicate id not found")
 
 
-def _save_summary_memories(summary: str, codes: str, source_ref: str, dedup_provider: Any = None) -> int:
+def _save_summary_memories(summary: str, codes: str, source_ref: str, dedup_provider: Any) -> int:
     from integrations.local_db import save_memory
 
     saved = 0
@@ -279,8 +277,8 @@ def _save_summary_memories(summary: str, codes: str, source_ref: str, dedup_prov
         try:
             dup_id = _find_duplicate(memory_type, content, dedup_provider)
         except Exception:
-            logger.debug("memory dedup check failed", exc_info=True)
-            dup_id = None
+            logger.debug("memory dedup check failed; skip memory save", exc_info=True)
+            continue
         if dup_id:
             logger.debug("memory dedup: '%s' duplicates #%d", content[:50], dup_id)
             continue
@@ -501,7 +499,7 @@ def save_session_summary(
         all_text = " ".join(m.get("content", "") or "" for m in messages)
         codes = extract_stock_codes(all_text)
         codes_str = ",".join(codes[:20])
-        dedup_provider = _get_dedup_provider() if _llm_dedup_enabled() else None
+        dedup_provider = _get_dedup_provider() or provider
         saved = _save_summary_memories(summary, codes_str, source_ref, dedup_provider)
         _mark_summary_processed(source_ref, summary_hash)
         if saved:

@@ -236,7 +236,7 @@ class TestSaveSessionSummary:
         finally:
             _close_tmp_db(local_db)
 
-    def test_dedup_unknown_duplicate_id_still_saves(self, monkeypatch, tmp_path):
+    def test_dedup_unknown_duplicate_id_skips_save(self, monkeypatch, tmp_path):
         local_db = _init_tmp_db(monkeypatch, tmp_path)
         try:
             local_db.save_memory("preference", "旧偏好", codes="000001")
@@ -251,8 +251,8 @@ class TestSaveSessionSummary:
             )
 
             memories = local_db.get_recent_memories(memory_type="preference", limit=10)
-            assert saved == 1
-            assert any(m["content"] == "新偏好" for m in memories)
+            assert saved == 0
+            assert [m["content"] for m in memories] == ["旧偏好"]
         finally:
             _close_tmp_db(local_db)
 
@@ -284,7 +284,7 @@ class TestSaveSessionSummary:
         finally:
             _close_tmp_db(local_db)
 
-    def test_dedup_failure_still_saves(self, monkeypatch, tmp_path):
+    def test_dedup_failure_skips_save(self, monkeypatch, tmp_path):
         local_db = _init_tmp_db(monkeypatch, tmp_path)
         try:
             local_db.save_memory("preference", "旧偏好", codes="000001")
@@ -297,7 +297,25 @@ class TestSaveSessionSummary:
             )
 
             memories = local_db.get_recent_memories(memory_type="preference", limit=10)
-            assert saved == 1
-            assert any(m["content"] == "新偏好" for m in memories)
+            assert saved == 0
+            assert [m["content"] for m in memories] == ["旧偏好"]
+        finally:
+            _close_tmp_db(local_db)
+
+    def test_invalid_dedup_response_skips_save(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            local_db.save_memory("preference", "旧偏好", codes="000001")
+
+            saved = _save_summary_memories(
+                "[偏好] 新偏好",
+                "000001",
+                "chat_log:s2",
+                _Provider(["MAYBE"]),
+            )
+
+            memories = local_db.get_recent_memories(memory_type="preference", limit=10)
+            assert saved == 0
+            assert [m["content"] for m in memories] == ["旧偏好"]
         finally:
             _close_tmp_db(local_db)
