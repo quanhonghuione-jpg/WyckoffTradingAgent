@@ -154,3 +154,44 @@ def test_market_report_expands_cash_portfolio_styles(tmp_path):
 
     assert "## 各交易风格最佳" in report
     assert "观察仓补仓 / 10天 / SL-6% / 无TP / 无Trail" in report
+
+
+def test_market_report_loads_merged_tp_artifact_layout(tmp_path):
+    from scripts.update_backtest_market_report import load_grid_cells
+
+    artifact = tmp_path / "backtest-grid-recent_6m-h10-sl-8-tr0-37"
+    for tp, cash_return in [(0, 1.0), (18, 3.0)]:
+        cell_dir = artifact / f"backtest-grid-recent_6m-h10-sl8-tp{tp}-tr0"
+        cell_dir.mkdir(parents=True)
+        (cell_dir / f"summary_20251201_20260531_h10_tp{tp}.md").write_text(
+            "\n".join(
+                [
+                    "# Wyckoff Funnel Daily Backtest",
+                    "",
+                    "- 区间: 2025-12-01 ~ 2026-05-31",
+                    "- 每日候选上限: Top 4",
+                    "- 股票池: main_chinext (sample=0)",
+                    "- 绩效引擎: legacy",
+                    "- 成交样本: 10",
+                    "- 胜率: 40.0%",
+                    "- 平均收益: 1.0%",
+                    "- 中位收益: 0.5%",
+                    "- 夏普比 (Sharpe Ratio): 0.3",
+                    "- 卡玛比 (Calmar Ratio): 0.1",
+                    "- 最大回撤: -10.0%",
+                    "- 组合总收益: 1.0%",
+                    "- 初始现金: 100000.00",
+                    "- 最终现金: 101000.00",
+                    f"- 总收益: {cash_return}%",
+                    "- 成交笔数: 4",
+                    "- 佣金合计: 20.00",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    cells = load_grid_cells(tmp_path)
+
+    assert [(cell.take_profit, cell.cash_total_return) for cell in cells] == [(0, 1.0), (18, 3.0)]
+    assert {cell.period_key for cell in cells} == {"recent_6m"}

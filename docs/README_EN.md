@@ -173,7 +173,7 @@ Pages include recommendations, signals, portfolio, agent memory, configuration, 
 
 ### Backtest Grid
 
-8 focused parameter combos run in parallel, outputs optimal parameters, Sharpe matrix, and strategy health check:
+8 focused parameter combos per period, outputs optimal parameters, Sharpe matrix, and strategy health check:
 
 | Optimal Params & Ranking | Parameter Matrix |
 |:---:|:---:|

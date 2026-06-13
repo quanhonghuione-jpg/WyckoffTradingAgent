@@ -173,7 +173,7 @@ Incluye recomendaciones, senales, cartera, memoria del agente, configuracion, lo
 
 ### Grid de backtest
 
-8 combinaciones enfocadas de parametros en paralelo, salida de parametros optimos, matriz Sharpe y revision de estrategia:
+8 combinaciones enfocadas de parametros por periodo, salida de parametros optimos, matriz Sharpe y revision de estrategia:
 
 | Parametros optimos & Ranking | Matriz de parametros |
 |:---:|:---:|
