@@ -173,8 +173,66 @@ class TestSaveSessionSummary:
 
             memories = local_db.get_recent_memories(limit=10)
             types = {m["memory_type"] for m in memories}
-            assert types == {"decision", "preference"}
+            assert types == {"decision", "preference", "session"}
             assert any(m["source_ref"] == "chat_log:s1" for m in memories)
+        finally:
+            _close_tmp_db(local_db)
+
+    def test_repeated_session_summary_hash_skips_llm(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            provider = _Provider(["[偏好] 不追涨"])
+            messages = [
+                {"role": "user", "content": "看看 000001"},
+                {"role": "assistant", "tool_calls": [{"id": "tc1", "name": "analyze_stock", "args": {}}]},
+                {"role": "tool", "content": '{"code":"000001"}'},
+                {"role": "assistant", "content": "先观察。"},
+            ]
+
+            save_session_summary(messages, provider, session_id="s1")
+            save_session_summary(messages, provider, session_id="s1")
+
+            memories = local_db.get_recent_memories(memory_type="preference", limit=10)
+            assert [m["content"] for m in memories] == ["不追涨"]
+            assert provider.outputs == []
+        finally:
+            _close_tmp_db(local_db)
+
+    def test_no_memory_summary_is_marked_processed(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            provider = _Provider(["无"])
+            messages = [
+                {"role": "user", "content": "看看 000001"},
+                {"role": "assistant", "tool_calls": [{"id": "tc1", "name": "analyze_stock", "args": {}}]},
+                {"role": "tool", "content": '{"code":"000001"}'},
+                {"role": "assistant", "content": "没有新增偏好。"},
+            ]
+
+            save_session_summary(messages, provider, session_id="s1")
+            save_session_summary(messages, provider, session_id="s1")
+
+            assert local_db.get_recent_memories(memory_type="preference", limit=10) == []
+            assert len(local_db.get_recent_memories(memory_type="session", limit=10)) == 1
+            assert provider.outputs == []
+        finally:
+            _close_tmp_db(local_db)
+
+    def test_deterministic_dedup_skips_exact_memory_without_llm(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            local_db.save_memory("preference", "不追涨", codes="000001")
+
+            saved = _save_summary_memories(
+                "[偏好] 不 追 涨",
+                "000001",
+                "chat_log:s2",
+                _FailingProvider(),
+            )
+
+            memories = local_db.get_recent_memories(memory_type="preference", limit=10)
+            assert saved == 0
+            assert [m["content"] for m in memories] == ["不追涨"]
         finally:
             _close_tmp_db(local_db)
 

@@ -5,6 +5,7 @@ Agent 跨会话记忆 — 会话摘要提取 + 记忆注入。
 from __future__ import annotations
 
 import logging
+import os
 import re
 from hashlib import sha256
 from json import dumps, loads
@@ -24,7 +25,7 @@ _SESSION_SUMMARY_PROMPT = """从以下对话中提取值得跨会话记忆的信
 - 当前市场状态（行情每天变）
 - 工具调用细节
 
-每条一行，前缀标注 [偏好] 或 [决策]。只写从对话中无法自动推断的洞察，没有则回复"无"。"""
+每条一行，前缀标注 [偏好] 或 [决策]。最多输出3条，只写从对话中无法自动推断的洞察，没有则回复"无"。"""
 
 _LAYER_REFRESH_PROMPT = """请基于以下偏好和决策记忆，生成更高层的长期记忆：
 - [画像] 用户稳定偏好/风险边界/操作习惯，最多3条
@@ -72,6 +73,8 @@ _LAYER_SOURCE_LIMIT = 30
 _LAYER_MIN_ATOMS = 3
 _LAYER_VERSION = 2
 _LAYER_NEW_ATOMS_THRESHOLD = 3
+_SESSION_SUMMARY_VERSION = 2
+_LLM_DEDUP_ENV = "WYCKOFF_MEMORY_LLM_DEDUP"
 
 
 def extract_stock_codes(text: str) -> list[str]:
@@ -131,15 +134,101 @@ def _source_ref(session_id: str) -> str:
     return f"chat_log:{session_id}" if session_id else ""
 
 
+def _summary_message_content(message: dict) -> str:
+    content = str(message.get("content", "") or "")
+    if message.get("role") == "tool" and len(content) > 200:
+        return content[:200] + "..."
+    return content
+
+
+def _dialog_text_for_summary(messages: list[dict]) -> str:
+    lines = []
+    for message in messages:
+        content = _summary_message_content(message)
+        if content:
+            lines.append(f"[{message.get('role', '')}] {content}")
+    return "\n".join(lines[-40:])
+
+
+def _session_summary_hash(dialog_text: str) -> str:
+    payload = f"v{_SESSION_SUMMARY_VERSION}\n{dialog_text}"
+    return sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 def _provider_text(provider: Any, user_text: str, system_prompt: str) -> str:
     chunks = list(provider.chat_stream([{"role": "user", "content": user_text}], [], system_prompt))
     return "".join(c.get("text", "") for c in chunks if c.get("type") == "text_delta")
+
+
+def _summary_already_processed(source_ref: str, summary_hash: str) -> bool:
+    if not source_ref:
+        return False
+    from integrations.local_db import get_recent_memories
+
+    for memory in get_recent_memories(memory_type="session", limit=50):
+        if memory.get("source_ref") != source_ref:
+            continue
+        metadata = _metadata(memory)
+        if metadata.get("summary_hash") == summary_hash:
+            return True
+    return False
+
+
+def _mark_summary_processed(source_ref: str, summary_hash: str) -> None:
+    if not source_ref:
+        return
+    from integrations.local_db import save_memory
+
+    save_memory(
+        "session",
+        f"summary:{summary_hash}",
+        source_ref=source_ref,
+        metadata={
+            "extractor": "session_summary_marker",
+            "summary_hash": summary_hash,
+            "summary_version": _SESSION_SUMMARY_VERSION,
+        },
+    )
 
 
 _DEDUP_PROMPT = """判断"新记忆"是否与以下已有记忆语义重复（含义相同或高度相似即为重复）。
 仅回复一行：
 - 重复则回复 DUPLICATE:<id>（id 为最匹配的已有记忆编号）
 - 不重复则回复 NEW"""
+
+
+def _normalize_memory_text(text: str) -> str:
+    return re.sub(r"[\W_]+", "", text.lower())
+
+
+def _bigrams(text: str) -> set[str]:
+    normalized = _normalize_memory_text(text)
+    if len(normalized) < 2:
+        return {normalized} if normalized else set()
+    return {normalized[i : i + 2] for i in range(len(normalized) - 1)}
+
+
+def _jaccard(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def _find_deterministic_duplicate(content: str, existing: list[dict]) -> int | None:
+    normalized = _normalize_memory_text(content)
+    grams = _bigrams(content)
+    for memory in existing:
+        existing_content = str(memory.get("content", ""))
+        existing_normalized = _normalize_memory_text(existing_content)
+        if normalized == existing_normalized:
+            return int(memory["id"])
+        if _jaccard(grams, _bigrams(existing_content)) >= 0.92:
+            return int(memory["id"])
+    return None
+
+
+def _llm_dedup_enabled() -> bool:
+    return os.getenv(_LLM_DEDUP_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _get_dedup_provider() -> Any | None:
@@ -160,12 +249,17 @@ def _get_dedup_provider() -> Any | None:
         return None
 
 
-def _find_duplicate(memory_type: str, content: str, provider: Any) -> int | None:
+def _find_duplicate(memory_type: str, content: str, provider: Any | None) -> int | None:
     """用 LLM 判断新记忆是否与同类型已有记忆语义重复，返回重复记忆 id 或 None。"""
     from integrations.local_db import get_recent_memories
 
     existing = get_recent_memories(memory_type=memory_type, limit=10)
     if not existing:
+        return None
+    duplicate_id = _find_deterministic_duplicate(content, existing)
+    if duplicate_id:
+        return duplicate_id
+    if provider is None:
         return None
     lines = [f"#{m['id']}: {m['content']}" for m in existing]
     user_text = "已有记忆:\n" + "\n".join(lines) + f"\n\n新记忆:\n{content}"
@@ -182,15 +276,14 @@ def _save_summary_memories(summary: str, codes: str, source_ref: str, dedup_prov
 
     saved = 0
     for memory_type, content in _summary_memories(summary):
-        if dedup_provider:
-            try:
-                dup_id = _find_duplicate(memory_type, content, dedup_provider)
-            except Exception:
-                logger.debug("memory dedup check failed", exc_info=True)
-                dup_id = None
-            if dup_id:
-                logger.debug("memory dedup: '%s' duplicates #%d", content[:50], dup_id)
-                continue
+        try:
+            dup_id = _find_duplicate(memory_type, content, dedup_provider)
+        except Exception:
+            logger.debug("memory dedup check failed", exc_info=True)
+            dup_id = None
+        if dup_id:
+            logger.debug("memory dedup: '%s' duplicates #%d", content[:50], dup_id)
+            continue
         saved += int(
             bool(
                 save_memory(
@@ -391,25 +484,27 @@ def save_session_summary(
     if not messages or len(messages) < 4 or not _has_tool_calls(messages):
         return
     try:
-        lines = []
-        for m in messages:
-            role = m.get("role", "")
-            content = m.get("content", "")
-            if role == "tool":
-                content = content[:200] + "..." if len(content) > 200 else content
-            if content:
-                lines.append(f"[{role}] {content}")
-        dialog_text = "\n".join(lines[-40:])
+        dialog_text = _dialog_text_for_summary(messages)
+        source_ref = _source_ref(session_id)
+        summary_hash = _session_summary_hash(dialog_text)
+        if _summary_already_processed(source_ref, summary_hash):
+            return
 
         summary = _provider_text(provider, dialog_text, _SESSION_SUMMARY_PROMPT)
-        if not summary or len(summary) < 10:
+        if not summary:
+            return
+        if len(summary) < 10 and not _summary_memories(summary):
+            if summary.strip().startswith("无"):
+                _mark_summary_processed(source_ref, summary_hash)
             return
 
         all_text = " ".join(m.get("content", "") or "" for m in messages)
         codes = extract_stock_codes(all_text)
         codes_str = ",".join(codes[:20])
-        dedup_provider = _get_dedup_provider()
-        if _save_summary_memories(summary, codes_str, _source_ref(session_id), dedup_provider):
+        dedup_provider = _get_dedup_provider() if _llm_dedup_enabled() else None
+        saved = _save_summary_memories(summary, codes_str, source_ref, dedup_provider)
+        _mark_summary_processed(source_ref, summary_hash)
+        if saved:
             if not skip_layers:
                 refresh_memory_layers(provider)
     except Exception:
