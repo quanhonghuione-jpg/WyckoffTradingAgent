@@ -264,6 +264,7 @@ jobs:
             --abc-filter \
             --entry-price-mode "${BT_ENTRY_PRICE_MODE}" \
             --entry-price-time "${BT_ENTRY_PRICE_TIME}" \
+            --entry-price-fallback "${BACKTEST_ENTRY_PRICE_FALLBACK}" \
             --cash-portfolio \
             --initial-cash "${BT_INITIAL_CASH}" \
             --max-positions "${BT_MAX_POSITIONS}" \
@@ -452,11 +453,18 @@ jobs:
           def risk_comment(c):
               if not c:
                   return '无有效样本'
+              cash_ret = c.get('cash_return')
               s = c.get('sharpe')
               avg = c.get('avg')
               mdd = c.get('mdd')
               notes = []
-              if s is not None and s < 0:
+              if cash_ret is not None and cash_ret < 0:
+                  notes.append('现金账户亏损')
+              elif cash_ret is not None and cash_ret < 5:
+                  notes.append('现金收益偏弱')
+              elif cash_ret is not None:
+                  notes.append('现金收益为正')
+              elif s is not None and s < 0:
                   notes.append('风险收益比偏弱')
               elif s is not None and s < 0.2:
                   notes.append('边际优势较薄')
@@ -467,6 +475,9 @@ jobs:
               if mdd is not None and mdd <= -15:
                   notes.append('回撤较大')
               return '；'.join(notes[:2]) if notes else '指标平衡'
+
+          def rank_value(c):
+              return c.get('cash_return') if c.get('cash_return') is not None else c.get('sharpe')
 
           elements = []
           run_url = os.environ.get('RUN_URL', '')
@@ -481,28 +492,29 @@ jobs:
           if not cells:
               elements.append({'tag': 'div', 'text': {'tag': 'lark_md', 'content': '⚠️ 未找到回测结果文件'}})
           else:
-              valid = [c for c in cells if c.get('sharpe') is not None]
+              valid = [c for c in cells if rank_value(c) is not None]
               if not valid:
                   elements.append({'tag': 'hr'})
-                  elements.append({'tag': 'div', 'text': {'tag': 'lark_md', 'content': '⚠️ 结果文件存在，但未解析到有效夏普指标'}})
+                  elements.append({'tag': 'div', 'text': {'tag': 'lark_md', 'content': '⚠️ 结果文件存在，但未解析到有效现金收益或夏普指标'}})
               else:
-                  best = max(valid, key=lambda c: c['sharpe'])
-                  ranked = sorted(valid, key=lambda c: c['sharpe'], reverse=True)
-                  pos_cnt = sum(1 for c in valid if (c.get('sharpe') or 0) > 0)
-                  neg_cnt = sum(1 for c in valid if (c.get('sharpe') or 0) <= 0)
+                  best = max(valid, key=rank_value)
+                  ranked = sorted(valid, key=rank_value, reverse=True)
+                  pos_cnt = sum(1 for c in valid if (rank_value(c) or 0) > 0)
+                  neg_cnt = sum(1 for c in valid if (rank_value(c) or 0) <= 0)
 
                   elements.append({'tag': 'hr'})
-                  bs = best.get('sharpe', 0) or 0
-                  tag = '🏆' if bs > 0 else '📌'
+                  br = rank_value(best) or 0
+                  tag = '🏆' if br > 0 else '📌'
                   tp_str = f'TP{best["tp"]}%' if best['tp'] else '无止盈'
                   tr_str = f'移动止盈-{best["tr"]}%' if best['tr'] else '无移动止盈'
                   elements.append({'tag': 'div', 'text': {'tag': 'lark_md',
-                      'content': f'{tag} **最优参数**: 持有{best["hold"]}天 / SL-{best["sl"]}% / {tp_str} / {tr_str}'}})
+                      'content': f'{tag} **最优参数（按现金收益）**: 持有{best["hold"]}天 / SL-{best["sl"]}% / {tp_str} / {tr_str}'}})
 
                   cols = [
+                      ('**现金收益**', f'{fmt(best.get("cash_return"), "+.2f")}%'),
+                      ('**最终现金**', f'{fmt(best.get("cash_final"), ",.2f")}'),
+                      ('**现金成交**', f'{int(best.get("cash_trades") or 0)}笔'),
                       ('**夏普**', f'{sharp_flag(best.get("sharpe"))} {fmt(best.get("sharpe"), ".3f")}'),
-                      ('**胜率**', f'{fmt(best.get("win"), ".1f")}%'),
-                      ('**均收**', f'{fmt(best.get("avg"), "+.2f")}%'),
                       ('**回撤**', f'{fmt(best.get("mdd"), ".1f")}%'),
                       ('**样本**', f'{int(best.get("trades") or 0)}笔'),
                   ]
@@ -514,23 +526,20 @@ jobs:
                       ]})
 
                   elements.append({'tag': 'div', 'text': {'tag': 'lark_md',
-                      'content': f'**策略体检**: {risk_comment(best)}  ·  正夏普组合 {pos_cnt} / 负夏普组合 {neg_cnt}'}})
-                  cash_pnl = None
-                  if best.get('cash_initial') is not None and best.get('cash_final') is not None:
-                      cash_pnl = best['cash_final'] - best['cash_initial']
+                      'content': f'**策略体检**: {risk_comment(best)}  ·  正现金收益组合 {pos_cnt} / 非正现金收益组合 {neg_cnt}'}})
                   elements.append({'tag': 'div', 'text': {'tag': 'lark_md',
-                      'content': f'**现金账户**: 初始 {fmt(best.get("cash_initial"), ",.2f")} → 最终 {fmt(best.get("cash_final"), ",.2f")}，盈亏 {fmt(cash_pnl, "+,.2f")}（{fmt(best.get("cash_return"), "+.2f")}%），成交 {int(best.get("cash_trades") or 0)} 笔'}})
+                      'content': f'**逐笔辅助指标**: 夏普 {sharp_flag(best.get("sharpe"))} {fmt(best.get("sharpe"), ".3f")}，胜率 {fmt(best.get("win"), ".1f")}%，均收 {fmt(best.get("avg"), "+.2f")}%'}})
 
                   # 参数梯队（完整表格：展示全部组合）
                   elements.append({'tag': 'hr'})
-                  elements.append({'tag': 'div', 'text': {'tag': 'lark_md', 'content': f'**参数梯队表（共 {len(ranked)} 组）**'}})
+                  elements.append({'tag': 'div', 'text': {'tag': 'lark_md', 'content': f'**参数梯队表（按现金收益排序，共 {len(ranked)} 组）**'}})
 
                   header_cols = [
                       ('**#**', 1),
                       ('**参数组合**', 4),
+                      ('**现金收益**', 2),
+                      ('**最终现金**', 2),
                       ('**夏普**', 2),
-                      ('**胜率**', 2),
-                      ('**均收**', 2),
                       ('**回撤**', 2),
                       ('**样本**', 2),
                   ]
@@ -559,9 +568,9 @@ jobs:
                       row = [
                           (str(i), 1),
                           (combo, 4),
+                          (f'{fmt(c.get("cash_return"), "+.2f")}%', 2),
+                          (fmt(c.get("cash_final"), ",.0f"), 2),
                           (sharpe_v, 2),
-                          (f'{fmt(c.get("win"), ".1f")}%', 2),
-                          (f'{fmt(c.get("avg"), "+.2f")}%', 2),
                           (f'{fmt(c.get("mdd"), ".1f")}%', 2),
                           (f'{int(c.get("trades") or 0)}笔', 2),
                       ]
@@ -614,7 +623,7 @@ jobs:
                                   {'tag': 'div', 'text': {'tag': 'lark_md', 'content': cell_text}}]})
                           elements.append({'tag': 'column_set', 'flex_mode': 'stretch', 'columns': row_cols})
 
-          template = 'blue' if (best and (best.get('sharpe') or 0) > 0) else 'orange' if cells else 'red'
+          template = 'blue' if (best and (rank_value(best) or 0) > 0) else 'orange' if cells else 'red'
           payload = {
               'msg_type': 'interactive',
               'card': {

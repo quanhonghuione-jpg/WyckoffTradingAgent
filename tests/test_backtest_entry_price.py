@@ -4,8 +4,9 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pytest
 
-from scripts.backtest_runner import _entry_on_or_after, _price_at_or_before
+from scripts.backtest_runner import _calc_trade_excursion_pct, _entry_on_or_after, _price_at_or_before
 
 
 def test_price_at_or_before_uses_last_minute_before_target() -> None:
@@ -63,3 +64,17 @@ def test_tail_1455_fallback_skip_marks_missing(monkeypatch) -> None:
     assert price is None
     assert entry_date is None
     assert source == "tail_1455_missing_skip"
+
+
+def test_calc_trade_excursion_uses_window_high_low() -> None:
+    d1 = datetime(2026, 1, 5).date()
+    d2 = datetime(2026, 1, 6).date()
+    day_ohlc = {
+        d1: (10.0, 11.0, 9.5, 10.6),
+        d2: (10.6, 12.0, 9.0, 11.5),
+    }
+
+    mfe, mae = _calc_trade_excursion_pct(day_ohlc, [d1, d2], 10.0)
+
+    assert mfe == pytest.approx(20.0)
+    assert mae == pytest.approx(-10.0)

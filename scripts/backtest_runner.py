@@ -123,6 +123,9 @@ class TradeRecord:
     regime: str = ""  # market regime at signal time
     entry_price_source: str = "daily_open"
     entry_target_time: str = ""
+    exit_reason: str = "unknown"
+    mfe_pct: float | None = None
+    mae_pct: float | None = None
 
 
 def _parse_date(v: str) -> date:
@@ -484,6 +487,25 @@ def _entry_price_source_counts(trades_df: pd.DataFrame) -> dict[str, int]:
         return {}
     counts = trades_df["entry_price_source"].value_counts(dropna=False).to_dict()
     return {str(k): int(v) for k, v in counts.items()}
+
+
+def _calc_trade_excursion_pct(
+    day_ohlc: dict[date, tuple[float, float, float, float]],
+    window: list[date],
+    entry_price: float,
+) -> tuple[float | None, float | None]:
+    if entry_price <= 0:
+        return None, None
+    max_high = entry_price
+    min_low = entry_price
+    for day in window:
+        candle = day_ohlc.get(day)
+        if candle is None:
+            continue
+        _, high, low, _ = candle
+        max_high = max(max_high, float(high))
+        min_low = min(min_low, float(low))
+    return (max_high / entry_price - 1.0) * 100.0, (min_low / entry_price - 1.0) * 100.0
 
 
 def _close_on_date(df: pd.DataFrame, d: date) -> float | None:
@@ -1095,9 +1117,11 @@ def run_backtest(
                     continue  # sltp/close_only 模式：剩余交易日不足以覆盖完整持有期
             actual_exit_anchor = trade_dates[actual_exit_idx]
 
+            exit_reason = "unknown"
             if exit_mode == "close_only":
                 # 兼容旧口径：持有 N 个市场交易日后按 anchor 日（或其后首个可得日）收盘离场。
                 exit_close, exit_date = _close_on_or_after(full_df, actual_exit_anchor)
+                exit_reason = "time_exit"
 
             elif exit_mode == "sltp":
                 # sltp 口径：T+1 合规，从入场次日起检查止盈止损。
@@ -1159,16 +1183,19 @@ def run_backtest(
                         if kind == "sl" and low <= px:
                             exit_close = px if open_px >= px else open_px
                             exit_date = mkt_day
+                            exit_reason = "stop_loss"
                             hit = True
                             break
                         if kind == "trail" and low <= px:
                             exit_close = px if open_px >= px else open_px
                             exit_date = mkt_day
+                            exit_reason = "trailing_stop"
                             hit = True
                             break
                         if kind == "tp" and high >= px:
                             exit_close = px if open_px <= px else open_px
                             exit_date = mkt_day
+                            exit_reason = "take_profit"
                             hit = True
                             break
                     if hit:
@@ -1184,6 +1211,7 @@ def run_backtest(
                         actual_exit_anchor,
                         lower_exclusive=signal_date,
                     )
+                    exit_reason = "time_exit"
 
             elif exit_mode == "atr":
                 # ATR 模式：对齐实盘 step4_rebalancer 的 ATR 动态止损 + trailing。
@@ -1246,10 +1274,12 @@ def run_backtest(
                     if low <= effective_stop:
                         exit_close = effective_stop if open_px >= effective_stop else open_px
                         exit_date = mkt_day
+                        exit_reason = "atr_stop"
                         hit = True
                     elif trailing_price is not None and low <= trailing_price:
                         exit_close = trailing_price if open_px >= trailing_price else open_px
                         exit_date = mkt_day
+                        exit_reason = "trailing_stop"
                         hit = True
 
                     if hit:
@@ -1264,9 +1294,20 @@ def run_backtest(
                         actual_exit_anchor,
                         lower_exclusive=signal_date,
                     )
+                    exit_reason = "time_exit"
 
             if exit_close is None or exit_date is None:
                 continue
+            day_ohlc = ohlc_lookup_cache.get(code)
+            if day_ohlc is None:
+                day_ohlc = _build_daily_ohlc_lookup(full_df)
+                ohlc_lookup_cache[code] = day_ohlc
+            try:
+                actual_exit_idx_for_excursion = trade_dates.index(exit_date)
+            except ValueError:
+                actual_exit_idx_for_excursion = actual_exit_idx
+            excursion_window = trade_dates[actual_entry_idx + 1 : actual_exit_idx_for_excursion + 1]
+            mfe_pct, mae_pct = _calc_trade_excursion_pct(day_ohlc, excursion_window, entry_close)
             entry_exec = entry_close * (1.0 + buy_friction_pct / 100.0)
             exit_exec = exit_close * (1.0 - sell_friction_pct / 100.0)
             if entry_exec <= 0:
@@ -1290,6 +1331,9 @@ def run_backtest(
                     regime=regime,
                     entry_price_source=entry_price_source,
                     entry_target_time=entry_price_time if entry_price_mode == "tail_1455" else "",
+                    exit_reason=exit_reason,
+                    mfe_pct=mfe_pct,
+                    mae_pct=mae_pct,
                 )
             )
 
@@ -1573,49 +1617,69 @@ def _calc_information_ratio(
     return float(ann_excess / ann_te)
 
 
+def _stats_for_trade_slice(df_slice: pd.DataFrame, hold_days: int = DEFAULT_HOLD_DAYS) -> dict:
+    ret = pd.to_numeric(df_slice.get("ret_pct"), errors="coerce").dropna()
+    n = len(ret)
+    if n == 0:
+        return {"trades": 0}
+    var95, cvar95 = _calc_cvar95_pct(ret)
+    exit_reason = df_slice.get("exit_reason", pd.Series(dtype=str)).astype(str)
+    stop_mask = exit_reason.isin({"stop_loss", "atr_stop"})
+    mfe = pd.to_numeric(df_slice.get("mfe_pct"), errors="coerce").dropna()
+    mae = pd.to_numeric(df_slice.get("mae_pct"), errors="coerce").dropna()
+    return {
+        "trades": n,
+        "win_rate_pct": float((ret > 0).mean() * 100.0),
+        "avg_ret_pct": float(ret.mean()),
+        "median_ret_pct": float(ret.median()),
+        "max_drawdown_pct": _calc_max_drawdown_pct(ret),
+        "sharpe_ratio": _calc_sharpe_ratio(ret, hold_days=hold_days),
+        "calmar_ratio": _calc_calmar_ratio(ret, hold_days=hold_days),
+        "var95_ret_pct": var95,
+        "cvar95_ret_pct": cvar95,
+        "max_consecutive_losses": _calc_max_consecutive_losses(ret),
+        "stop_exit_rate_pct": float(stop_mask.mean() * 100.0) if len(exit_reason) else None,
+        "avg_mfe_pct": float(mfe.mean()) if len(mfe) else None,
+        "avg_mae_pct": float(mae.mean()) if len(mae) else None,
+    }
+
+
+def _group_trade_stats(trades_df: pd.DataFrame, column: str, hold_days: int) -> dict[str, dict]:
+    if trades_df.empty or column not in trades_df.columns:
+        return {}
+    grouped: dict[str, dict] = {}
+    for value in sorted(trades_df[column].dropna().unique(), key=str):
+        key = str(value).strip() or "-"
+        mask = trades_df[column] == value
+        if mask.any():
+            grouped[key] = _stats_for_trade_slice(trades_df[mask], hold_days)
+    return grouped
+
+
 def _calc_stratified_stats(trades_df: pd.DataFrame, hold_days: int = DEFAULT_HOLD_DAYS) -> dict[str, dict]:
     """
-    按 track (Trend/Accum) 和 regime 分层统计。
-    返回 {"by_track": {"Trend": {...}, "Accum": {...}},
-           "by_regime": {"RISK_ON": {...}, "RISK_OFF": {...}, ...}}
+    按 track、regime、trigger、exit_reason 和 entry_price_source 分层统计。
     """
-    result: dict[str, dict] = {"by_track": {}, "by_regime": {}}
+    result: dict[str, dict] = {
+        "by_track": {},
+        "by_regime": {},
+        "by_trigger": {},
+        "by_exit_reason": {},
+        "by_entry_price_source": {},
+    }
     if trades_df.empty:
         return result
-
-    def _stats_for_slice(df_slice: pd.DataFrame) -> dict:
-        ret = pd.to_numeric(df_slice.get("ret_pct"), errors="coerce").dropna()
-        n = len(ret)
-        if n == 0:
-            return {"trades": 0}
-        var95, cvar95 = _calc_cvar95_pct(ret)
-        return {
-            "trades": n,
-            "win_rate_pct": float((ret > 0).mean() * 100.0),
-            "avg_ret_pct": float(ret.mean()),
-            "median_ret_pct": float(ret.median()),
-            "max_drawdown_pct": _calc_max_drawdown_pct(ret),
-            "sharpe_ratio": _calc_sharpe_ratio(ret, hold_days=hold_days),
-            "calmar_ratio": _calc_calmar_ratio(ret, hold_days=hold_days),
-            "var95_ret_pct": var95,
-            "cvar95_ret_pct": cvar95,
-            "max_consecutive_losses": _calc_max_consecutive_losses(ret),
-        }
 
     # by track
     for track_val in ["Trend", "Accum"]:
         mask = trades_df["track"] == track_val
         if mask.any():
-            result["by_track"][track_val] = _stats_for_slice(trades_df[mask])
+            result["by_track"][track_val] = _stats_for_trade_slice(trades_df[mask], hold_days)
 
-    # by regime
-    if "regime" in trades_df.columns:
-        for regime_val in trades_df["regime"].dropna().unique():
-            regime_str = str(regime_val).strip()
-            if regime_str:
-                mask = trades_df["regime"] == regime_str
-                if mask.any():
-                    result["by_regime"][regime_str] = _stats_for_slice(trades_df[mask])
+    result["by_regime"] = _group_trade_stats(trades_df, "regime", hold_days)
+    result["by_trigger"] = _group_trade_stats(trades_df, "trigger", hold_days)
+    result["by_exit_reason"] = _group_trade_stats(trades_df, "exit_reason", hold_days)
+    result["by_entry_price_source"] = _group_trade_stats(trades_df, "entry_price_source", hold_days)
 
     # cross: track × regime
     cross: dict[str, dict] = {}
@@ -1627,7 +1691,7 @@ def _calc_stratified_stats(trades_df: pd.DataFrame, hold_days: int = DEFAULT_HOL
             mask = (trades_df["track"] == track_val) & (trades_df["regime"] == regime_str)
             if mask.any():
                 key = f"{track_val}_{regime_str}"
-                cross[key] = _stats_for_slice(trades_df[mask])
+                cross[key] = _stats_for_trade_slice(trades_df[mask], hold_days)
     if cross:
         result["by_track_regime"] = cross
 
@@ -1892,6 +1956,31 @@ def _entry_price_note(summary: dict) -> str:
     return f"- 入场口径：信号日收盘后出信号，T+1 14:55 分钟线价格买入（跳过一字涨停日，fallback={fallback}{source_text}）。"
 
 
+def _append_diagnostic_table(lines: list[str], title: str, groups: dict[str, dict], *, limit: int = 12) -> None:
+    if not groups:
+        return
+    ranked = sorted(groups.items(), key=lambda kv: (-int(kv[1].get("trades") or 0), kv[0]))[:limit]
+    lines.extend(["", f"## {title}", ""])
+    lines.append("| 分组 | 笔数 | 胜率(%) | 均收(%) | 止损率(%) | 平均MFE(%) | 平均MAE(%) |")
+    lines.append("|------|---:|---:|---:|---:|---:|---:|")
+    for key, stat in ranked:
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    key,
+                    _fmt_metric(stat.get("trades"), 0),
+                    _fmt_metric(stat.get("win_rate_pct"), 2),
+                    _fmt_metric(stat.get("avg_ret_pct"), 3),
+                    _fmt_metric(stat.get("stop_exit_rate_pct"), 2),
+                    _fmt_metric(stat.get("avg_mfe_pct"), 3),
+                    _fmt_metric(stat.get("avg_mae_pct"), 3),
+                ]
+            )
+            + " |"
+        )
+
+
 def _build_summary_md(summary: dict) -> str:
     use_current_meta = bool(summary.get("use_current_meta"))
     meta_mode = (
@@ -2073,6 +2162,10 @@ def _build_summary_md(summary: dict) -> str:
         ]:
             vals = [_fmt_metric(by_regime[rk].get(key), nd) for rk in regime_keys]
             lines.append(f"| {label} | " + " | ".join(vals) + " |")
+
+    _append_diagnostic_table(lines, "分层诊断：按触发信号", stratified.get("by_trigger", {}))
+    _append_diagnostic_table(lines, "分层诊断：按退出原因", stratified.get("by_exit_reason", {}))
+    _append_diagnostic_table(lines, "分层诊断：按入场价格来源", stratified.get("by_entry_price_source", {}))
 
     # 策略调整建议
     advice_items = _generate_strategy_advice(summary)
@@ -2265,6 +2358,12 @@ def main() -> int:
         help=f"tail_1455 模式下的目标分钟时间 (default: {DEFAULT_ENTRY_PRICE_TIME})",
     )
     parser.add_argument(
+        "--entry-price-fallback",
+        choices=["close", "skip", "error"],
+        default=DEFAULT_ENTRY_PRICE_FALLBACK,
+        help="tail_1455 缺分钟线时的处理：close=日收盘回退，skip=跳过，error=失败",
+    )
+    parser.add_argument(
         "--cash-portfolio",
         action="store_true",
         default=False,
@@ -2334,6 +2433,7 @@ def main() -> int:
                 abc_filter=args.abc_filter,
                 entry_price_mode=args.entry_price_mode,
                 entry_price_time=args.entry_price_time,
+                entry_price_fallback=args.entry_price_fallback,
                 cash_portfolio=args.cash_portfolio,
                 initial_cash=args.initial_cash,
                 max_positions=args.max_positions,

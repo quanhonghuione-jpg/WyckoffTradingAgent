@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import pandas as pd
+
 from core.wyckoff_engine import FunnelResult
-from scripts.backtest_runner import _apply_regime_position_filter, _select_ai_input_codes
+from scripts.backtest_runner import _apply_regime_position_filter, _calc_stratified_stats, _select_ai_input_codes
 
 
 def test_all_formal_l4_selection_excludes_stage_only_candidates() -> None:
@@ -37,3 +39,38 @@ def test_regime_position_filter_blocks_defensive_regimes() -> None:
     assert _apply_regime_position_filter(codes, "RISK_OFF") == []
     assert _apply_regime_position_filter(codes, "NEUTRAL") == ["A", "B"]
     assert _apply_regime_position_filter(codes, "RISK_ON") == ["A", "B"]
+
+
+def test_stratified_stats_include_exit_and_excursion_diagnostics() -> None:
+    trades = pd.DataFrame(
+        [
+            {
+                "track": "Trend",
+                "regime": "RISK_ON",
+                "trigger": "sos",
+                "entry_price_source": "daily_close_fallback",
+                "exit_reason": "stop_loss",
+                "ret_pct": -6.9,
+                "mfe_pct": 3.0,
+                "mae_pct": -7.0,
+            },
+            {
+                "track": "Trend",
+                "regime": "RISK_ON",
+                "trigger": "sos",
+                "entry_price_source": "tail_1455",
+                "exit_reason": "time_exit",
+                "ret_pct": 4.0,
+                "mfe_pct": 9.0,
+                "mae_pct": -2.0,
+            },
+        ]
+    )
+
+    stats = _calc_stratified_stats(trades, hold_days=5)
+
+    assert stats["by_trigger"]["sos"]["stop_exit_rate_pct"] == 50.0
+    assert stats["by_trigger"]["sos"]["avg_mfe_pct"] == 6.0
+    assert stats["by_trigger"]["sos"]["avg_mae_pct"] == -4.5
+    assert stats["by_exit_reason"]["stop_loss"]["trades"] == 1
+    assert stats["by_entry_price_source"]["daily_close_fallback"]["trades"] == 1
