@@ -94,7 +94,7 @@ uv run python scripts/signal_feedback_job.py
 
 | 表 | 写入方 | 读取方 | 作用 |
 |----|--------|--------|------|
-| `signal_observations` | 漏斗 `daily_job.py` | feedback job | 记录某日某股票触发了什么 L4 信号，是否进入 AI，是否被 AI 推荐。 |
+| `signal_observations` | 漏斗 `daily_job.py` | feedback job | 记录某日某股票触发了什么 L4 信号，是否进入 AI，是否被 AI 推荐，以及当日 price-action footprint。 |
 | `signal_outcomes` | feedback job | feedback job | 记录每个 observation 在 1/3/5/10/20 日后的收益、回撤和完成状态。 |
 | `signal_health_daily` | feedback job | 漏斗 | 按 signal / regime / horizon 聚合胜率、平均收益、样本数和权重。 |
 | `signal_registry` | feedback job | 漏斗 | 管理信号生命周期：`ACTIVE`、`WATCH`、`EXPERIMENTAL`、`RETIRED`。 |
@@ -128,6 +128,19 @@ stateDiagram-v2
 ```
 
 registry 只负责控制动态策略是否使用信号；原始 observations 仍会记录，避免因为下线后失去后续观测能力。
+
+## Price-Action Footprint
+
+`signal_observations.features_json.price_action_footprint` 记录每个信号日的量价痕迹，用于后续回答“哪一种主力行为痕迹有效”，不作为新的候选来源：
+
+- `absorption_score`：放量但收盘不弱、支撑收回、下影承接等吸收迹象。
+- `dry_up_score`：缩量回踩、波动收窄，验证卖压是否枯竭。
+- `breakout_quality_score`：突破位、量能、收盘位置和上影压力。
+- `supply_pressure_score`：放量弱收、长上影、潜在派发压力。
+- `failed_breakout_score`：盘中突破后收不住，标记失败突破风险。
+- `reclaim_score`：跌破支撑后快速收回的 Spring / reclaim 质量。
+
+这些字段和 `springboard_*` 一起落库，后续由 `signal_outcomes` 验证，而不是直接把外部或人工名单推入 AI 候选池。
 
 ## Shadow 复盘怎么看
 

@@ -25,7 +25,7 @@ flowchart LR
 
 | 方向 | 目标 | 当前实现 | 状态 |
 |------|------|----------|------|
-| 方向一：信号衰减监控 | 追踪 SOS / Spring / LPS / EVR / Compression 的后续表现 | `signal_observations` 记录样本，`signal_outcomes` 计算收益 / 回撤，`signal_health_daily` 聚合健康度 | 已落地一期 |
+| 方向一：信号衰减监控 | 追踪 SOS / Spring / LPS / EVR / Compression 的后续表现 | `signal_observations` 记录样本和 price-action footprint，`signal_outcomes` 计算收益 / 回撤，`signal_health_daily` 聚合健康度 | 已落地一期 |
 | 方向二：多策略动态分配 | AI 候选配额从静态规则变为数据驱动 | `dynamic_policy.py` 根据信号权重调整 Trend / Accum 配额，支持 `off` / `shadow` / `on` | 已落地框架，待 shadow 复盘 |
 | 方向三：信号生命周期管理 | 新信号孵化、正式上线、观察、退役 | `signal_registry` 维护 `ACTIVE` / `WATCH` / `EXPERIMENTAL` / `RETIRED` | 已落地骨架，阈值待样本校准 |
 | 方向四：外部观察验证 | 验证人工/社区/其它系统关注的股票是否真有结构优势 | `external_seed_observations` 记录 L1/L2/L4 位置，L4 确认样本补写 `signal_observations` | 已落地 shadow 观察 |
@@ -52,6 +52,7 @@ flowchart TD
 - 按 `signal_type + regime + horizon_days` 聚合，同时生成 `ALL` regime 汇总。
 - 默认 registry 判断使用 10 日窗口。
 - 样本不足时不贸然退役，只降低权重或保持实验态。
+- `features_json.price_action_footprint` 记录承接、缩量、突破质量、派发压力和失败突破标签，用于把“主力痕迹”从主观描述变成可回测特征。
 
 ## 方向二：多策略动态分配
 

@@ -265,8 +265,32 @@ def _shadow_observation_inputs(step2_details: dict) -> tuple[dict[str, list[tupl
     return triggers, source_map, score_map
 
 
-def _observation_context(step2_details: dict) -> tuple[dict, dict, dict, dict, dict, dict, dict]:
+def _merge_observation_trigger_maps(step2_details: dict) -> dict[str, list[tuple[str, float]]]:
     metrics = step2_details.get("metrics", {}) or {}
+    out: dict[str, list[tuple[str, float]]] = {}
+    for trigger_map in (
+        step2_details.get("review_triggers") or step2_details.get("triggers") or {},
+        metrics.get("external_seed_l4_triggers") or {},
+    ):
+        for signal_type, hits in trigger_map.items():
+            out.setdefault(str(signal_type).strip().lower(), []).extend(hits or [])
+    return {signal_type: hits for signal_type, hits in out.items() if signal_type and hits}
+
+
+def _build_footprint_map(step2_details: dict) -> dict[str, dict]:
+    from core.price_action_footprint import build_price_action_footprint_map
+
+    metrics = step2_details.get("metrics", {}) or {}
+    df_map = step2_details.get("all_df_map") or metrics.get("all_df_map") or {}
+    return build_price_action_footprint_map(_merge_observation_trigger_maps(step2_details), df_map)
+
+
+def _observation_context(step2_details: dict) -> tuple[dict, dict, dict, dict, dict, dict, dict, dict]:
+    metrics = step2_details.get("metrics", {}) or {}
+    footprint_map = step2_details.get("footprint_map")
+    if footprint_map is None:
+        footprint_map = _build_footprint_map(step2_details)
+        step2_details["footprint_map"] = footprint_map
     return (
         metrics,
         step2_details.get("name_map", {}) or {},
@@ -275,6 +299,7 @@ def _observation_context(step2_details: dict) -> tuple[dict, dict, dict, dict, d
         metrics.get("layer2_channel_map", {}) or {},
         metrics.get("latest_close_map", {}) or {},
         step2_details.get("springboard_map") or _build_springboard_map(step2_details),
+        footprint_map,
     )
 
 
@@ -298,8 +323,8 @@ def _build_signal_observation_rows(
 ) -> list[dict]:
     from core.signal_feedback import build_signal_observations
 
-    metrics, name_map, sector_map, stage_map, channel_map, close_map, springboard_map = _observation_context(
-        step2_details
+    metrics, name_map, sector_map, stage_map, channel_map, close_map, springboard_map, footprint_map = (
+        _observation_context(step2_details)
     )
     selected_for_ai = step2_details.get("selected_for_ai", []) or []
     return build_signal_observations(
@@ -316,6 +341,7 @@ def _build_signal_observation_rows(
         latest_close_map=close_map,
         source_map=_signal_observation_source_map(step2_details),
         springboard_map=springboard_map,
+        footprint_map=footprint_map,
         selection_mode=os.getenv("FUNNEL_AI_SELECTION_MODE", "quota"),
         policy_version=f"dynamic:{os.getenv('FUNNEL_DYNAMIC_POLICY', 'off')}",
         rank_map={str(code): idx + 1 for idx, code in enumerate(selected_for_ai)},
@@ -328,7 +354,7 @@ def _build_shadow_observation_rows(step2_details: dict, regime: str) -> list[dic
     shadow_triggers, shadow_source_map, shadow_score_map = _shadow_observation_inputs(step2_details)
     if not shadow_triggers:
         return []
-    _, name_map, sector_map, stage_map, channel_map, close_map, _ = _observation_context(step2_details)
+    _, name_map, sector_map, stage_map, channel_map, close_map, _, footprint_map = _observation_context(step2_details)
     return build_signal_observations(
         _latest_trade_date_str(),
         shadow_triggers,
@@ -340,6 +366,7 @@ def _build_shadow_observation_rows(step2_details: dict, regime: str) -> list[dic
         channel_map=channel_map,
         latest_close_map=close_map,
         source_map=shadow_source_map,
+        footprint_map=footprint_map,
         selection_mode="shadow",
         policy_version=f"dynamic:{os.getenv('FUNNEL_DYNAMIC_POLICY', 'off')}",
     )
@@ -348,8 +375,8 @@ def _build_shadow_observation_rows(step2_details: dict, regime: str) -> list[dic
 def _build_external_seed_signal_rows(step2_details: dict, regime: str) -> list[dict]:
     from core.signal_feedback import build_signal_observations
 
-    metrics, name_map, sector_map, stage_map, channel_map, close_map, springboard_map = _observation_context(
-        step2_details
+    metrics, name_map, sector_map, stage_map, channel_map, close_map, springboard_map, footprint_map = (
+        _observation_context(step2_details)
     )
     selected = {str(code).strip() for code in step2_details.get("selected_for_ai", []) if str(code).strip()}
     triggers = {
@@ -373,6 +400,7 @@ def _build_external_seed_signal_rows(step2_details: dict, regime: str) -> list[d
         latest_close_map=close_map,
         source_map=source_map,
         springboard_map=springboard_map,
+        footprint_map=footprint_map,
         selection_mode="external_seed_shadow",
         policy_version=f"external_seed:{metrics.get('external_seed_source') or 'external'}",
     )

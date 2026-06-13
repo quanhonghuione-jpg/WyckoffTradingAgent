@@ -69,6 +69,24 @@ def _springboard_observation_fields(
     }
 
 
+def _footprint_fields(
+    signal_type: str,
+    code: str,
+    footprint_map: dict[str, dict[str, Any]] | None,
+) -> dict[str, Any]:
+    fields = (footprint_map or {}).get(f"{signal_type}:{code}") or (footprint_map or {}).get(code)
+    return dict(fields or {})
+
+
+def _features_json(footprint: dict[str, Any], springboard: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if footprint:
+        out["price_action_footprint"] = footprint
+    if springboard:
+        out["springboard"] = springboard
+    return out
+
+
 def _trigger_tags_by_code(triggers: dict[str, list[tuple[str, float]]]) -> dict[str, list[str]]:
     tags: dict[str, set[str]] = {}
     for signal_type, hits in triggers.items():
@@ -90,6 +108,8 @@ def _signal_observation_row(
     signal_type, code, trigger_score = item
     stage = ctx["stage_map"].get(code, "")
     channel = ctx["channel_map"].get(code, "")
+    springboard = _springboard_observation_fields(signal_type, code, ctx["springboard_map"])
+    footprint = _footprint_fields(signal_type, code, ctx["footprint_map"])
     return {
         "market": market,
         "trade_date": trade_date,
@@ -113,9 +133,10 @@ def _signal_observation_row(
         "selected_for_ai": code in ctx["selected"],
         "ai_recommended": code in ctx["recommended"],
         "source": ctx["source_map"].get(code, "funnel"),
+        "features_json": _features_json(footprint, springboard),
         "lifecycle_status": "ACTIVE",
         "updated_at": now_iso,
-        **_springboard_observation_fields(signal_type, code, ctx["springboard_map"]),
+        **springboard,
     }
 
 
@@ -135,6 +156,7 @@ def build_signal_observations(
     latest_close_map: dict[str, float] | None = None,
     source_map: dict[str, str] | None = None,
     springboard_map: dict[str, dict[str, Any]] | None = None,
+    footprint_map: dict[str, dict[str, Any]] | None = None,
     selection_mode: str = "",
     policy_version: str = "",
     rank_map: dict[str, int] | None = None,
@@ -151,6 +173,7 @@ def build_signal_observations(
         "latest_close_map": latest_close_map or {},
         "source_map": source_map or {},
         "springboard_map": springboard_map,
+        "footprint_map": footprint_map,
         "selection_mode": selection_mode,
         "policy_version": policy_version,
         "rank_map": rank_map or {},

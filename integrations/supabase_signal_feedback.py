@@ -24,6 +24,7 @@ OPTIONAL_SIGNAL_OBSERVATION_COLUMNS = (
     "selection_mode",
     "policy_version",
     "candidate_rank",
+    "features_json",
 )
 
 

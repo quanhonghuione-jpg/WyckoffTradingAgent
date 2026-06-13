@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from core.dynamic_policy import build_signal_weight_map, filter_triggers_by_registry, resolve_dynamic_candidate_policy
+from core.price_action_footprint import compute_price_action_footprint
 from core.signal_confirmation import score_springboard_abc
 from core.signal_feedback import build_signal_observations, build_signal_registry_updates, summarize_signal_health
 from scripts.signal_feedback_job import _default_registry_horizon, _outcome_rows
@@ -47,6 +48,33 @@ class _CapturingUpsertClient:
         return _CapturingUpsertQuery(self)
 
 
+class _SchemaMissThenCaptureQuery:
+    def __init__(self, client):
+        self.client = client
+
+    def upsert(self, rows: list[dict], *, on_conflict: str):
+        self.client.calls += 1
+        self.client.rows = rows
+        self.client.conflict = on_conflict
+        return self
+
+    def execute(self):
+        if self.client.calls == 1:
+            raise RuntimeError("Could not find column features_json in schema cache")
+        return None
+
+
+class _SchemaMissThenCaptureClient:
+    def __init__(self):
+        self.calls = 0
+        self.rows: list[dict] = []
+        self.conflict = ""
+
+    def table(self, name: str):
+        self.table_name = name
+        return _SchemaMissThenCaptureQuery(self)
+
+
 def test_build_signal_observations_marks_selection_and_source():
     rows = build_signal_observations(
         "2026-05-25",
@@ -59,6 +87,14 @@ def test_build_signal_observations_marks_selection_and_source():
         score_map={"000001": 88},
         latest_close_map={"000001": 10.5},
         source_map={"000002": "l2_bypass"},
+        footprint_map={
+            "sos:000001": {
+                "version": "price_action_footprint_v1",
+                "bias": "demand",
+                "tags": ["quality_breakout"],
+                "negative_tags": [],
+            }
+        },
         springboard_map={
             "sos:000001": {
                 "springboard_grade": "A+B",
@@ -94,10 +130,32 @@ def test_build_signal_observations_marks_selection_and_source():
     assert first["springboard_met_count"] == 2
     assert first["springboard_a"] is True
     assert first["springboard_evidence"]["a_hits"][0]["date"] == "2026-05-24"
+    assert first["features_json"]["price_action_footprint"]["tags"] == ["quality_breakout"]
+    assert first["features_json"]["springboard"]["springboard_grade"] == "A+B"
     assert second["track"] == "Accum"
     assert second["source"] == "l2_bypass"
     assert second["springboard_grade"] == "C"
     assert second["springboard_c"] is True
+
+
+def test_price_action_footprint_marks_breakout_and_supply_pressure():
+    dates = pd.date_range("2026-05-01", periods=30, freq="D")
+    df = pd.DataFrame(
+        {
+            "date": dates,
+            "open": [10.0] * 30,
+            "high": [10.4] * 29 + [11.2],
+            "low": [9.8] * 30,
+            "close": [10.1] * 29 + [9.95],
+            "volume": [100.0] * 29 + [260.0],
+        }
+    )
+
+    fp = compute_price_action_footprint(df, "sos")
+
+    assert fp["failed_breakout_20"] is True
+    assert "failed_breakout" in fp["negative_tags"]
+    assert fp["supply_pressure_score"] >= 70
 
 
 def test_score_springboard_abc_returns_persistable_metadata():
@@ -167,6 +225,30 @@ def test_signal_observations_conflict_keeps_daily_tags(monkeypatch):
     assert supabase_signal_feedback.upsert_signal_observations(rows) == 2
     assert client.conflict == "market,trade_date,code,signal_type"
     assert [row["trade_date"] for row in client.rows] == ["2026-06-10", "2026-06-11"]
+
+
+def test_signal_observations_drop_features_json_when_schema_missing(monkeypatch):
+    from integrations import supabase_signal_feedback
+
+    client = _SchemaMissThenCaptureClient()
+    monkeypatch.setenv("WYCKOFF_WRITE_CONTEXT", "server_job")
+    monkeypatch.setattr(supabase_signal_feedback, "_configured", lambda: True)
+    monkeypatch.setattr(supabase_signal_feedback, "_admin", lambda: client)
+    monkeypatch.setattr(supabase_signal_feedback, "_close", lambda _client: None)
+
+    rows = [
+        {
+            "market": "cn",
+            "trade_date": "2026-06-10",
+            "code": "000001",
+            "signal_type": "spring",
+            "features_json": {"price_action_footprint": {"bias": "demand"}},
+        }
+    ]
+
+    assert supabase_signal_feedback.upsert_signal_observations(rows) == 1
+    assert client.calls == 2
+    assert "features_json" not in client.rows[0]
 
 
 def test_summarize_signal_health_classifies_watch_and_all_regime():
