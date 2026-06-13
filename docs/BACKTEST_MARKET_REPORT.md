@@ -9,15 +9,15 @@
 - 股票池：`main_chinext`，主板 + 创业板，剔除 ST
 - 默认资金：`100000`
 - 最大持仓：`4`
-- 买入：T 日收盘后产生信号，T+1 `14:55` 分钟线价格买入
-- fallback：分钟线缺失时由 `BACKTEST_ENTRY_PRICE_FALLBACK` 控制，默认 `close`
+- 买入：T 日收盘后产生信号，T+1 开盘价买入
+- fallback：仅 `entry_price_mode=tail_1455` 时生效；当前默认不再使用分钟线入场
 - 手续费：买卖双边万分之 2，单笔成交额低于 `10000` 元时固定收 `5` 元
-- 候选池：`FUNNEL_AI_SELECTION_MODE=all_formal_l4`，只回放正式 L4 命中候选，不再把 L3 补位当成 `Layer3_Backup`
+- 候选池：`FUNNEL_AI_SELECTION_MODE=tradeable_l4`，只回放结构型 L4 候选，默认剔除裸 SOS/EVR 追高噪声
 - 约束：T+1、一字板不可成交、卖出后才能补位、最多持有 4 只
 
 ## 最近一次链路校验
 
-本地使用 GitHub Actions snapshot 回放熊市区间，验证修正后的候选口径、现金账户和 `14:55` 入场链路可以跑通。
+本地使用 GitHub Actions snapshot 回放熊市区间，验证现金账户链路和旧候选口径可以跑通。该样例仍是旧 `14:55` fallback 口径，不代表当前生产默认值。
 
 | 项目 | 值 |
 |------|----|
@@ -36,7 +36,7 @@
 这次结果说明两件事：
 
 1. 链路已按新口径收紧，旧报告里的 `Layer3_Backup` 不能再作为有效分类使用。
-2. 样例仍然全部落到日收盘 fallback，说明当前 snapshot 没有真实 14:55 分钟线；如果要验证真实尾盘成交，需要使用包含分钟线的数据源或把 fallback 改成 `skip` 做严格回测。
+2. 后续默认使用 T+1 开盘价；如果专门验证尾盘成交，需要显式选择 `entry_price_mode=tail_1455`，并使用包含分钟线的数据源或把 fallback 改成 `skip` 做严格回测。
 
 ## 解读边界
 
@@ -49,4 +49,4 @@
 
 - 每次 Backtest Grid 完成后，优先查看对应 Actions artifact 的 `summary_*.md`、`trades_*.csv` 和飞书卡片。
 - 若要更新本页，应只写入已经确认过的生产口径或明确标注为“样例”的回测结果。
-- 如果 `entry_price_source_counts` 长期显示 `daily_close_fallback`，不要把结果解读成真实 14:55 成交表现。
+- 如果显式使用 `tail_1455` 且 `entry_price_source_counts` 长期显示 `daily_close_fallback`，不要把结果解读成真实 14:55 成交表现。

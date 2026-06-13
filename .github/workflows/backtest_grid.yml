@@ -49,9 +49,9 @@ on:
         required: true
         type: choice
         options:
-          - "tail_1455"
           - "open"
-        default: "tail_1455"
+          - "tail_1455"
+        default: "open"
       entry_price_time:
         description: "分钟线入场时间，仅 entry_price_mode=tail_1455 生效"
         required: true
@@ -89,7 +89,7 @@ env:
   BT_SAMPLE_SIZE: ${{ inputs.sample_size || '0' }}
   BT_TRADING_DAYS: ${{ inputs.trading_days || '320' }}
   BT_TRAILING_STOP: ${{ inputs.trailing_stop || '0' }}
-  BT_ENTRY_PRICE_MODE: ${{ inputs.entry_price_mode || 'tail_1455' }}
+  BT_ENTRY_PRICE_MODE: ${{ inputs.entry_price_mode || 'open' }}
   BT_ENTRY_PRICE_TIME: ${{ inputs.entry_price_time || '14:55' }}
   BACKTEST_ENTRY_PRICE_FALLBACK: ${{ inputs.entry_price_fallback || 'close' }}
   BT_INITIAL_CASH: ${{ inputs.initial_cash || '100000' }}
@@ -187,7 +187,7 @@ jobs:
       TZ: Asia/Shanghai
       TICKFLOW_API_KEY: ${{ secrets.TICKFLOW_API_KEY }}
       TICKFLOW_BASE_URL: ${{ secrets.TICKFLOW_BASE_URL }}
-      FUNNEL_AI_SELECTION_MODE: "all_formal_l4"
+      FUNNEL_AI_SELECTION_MODE: "tradeable_l4"
       FUNNEL_AI_TOTAL_CAP: "8"
       FUNNEL_AI_RISK_ON_TREND: "3"
       FUNNEL_AI_RISK_ON_ACCUM: "5"

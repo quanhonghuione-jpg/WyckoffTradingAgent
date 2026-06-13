@@ -92,7 +92,12 @@ REGIME_POSITION_RATIO: dict[str, float] = {
     "CRASH": 0.0,  # 崩盘 → 不开仓
     "BLACK_SWAN": 0.0,
 }
-FUNNEL_AI_SELECTION_MODE = os.getenv("FUNNEL_AI_SELECTION_MODE", "legacy_full_hits").strip().lower()
+FUNNEL_AI_SELECTION_MODE = os.getenv("FUNNEL_AI_SELECTION_MODE", "tradeable_l4").strip().lower()
+_TRADEABLE_L4_SELECTION_MODES = {
+    "tradeable_l4",
+    "quality_l4",
+    "strict_l4",
+}
 _FORMAL_L4_SELECTION_MODES = {
     "all_formal_l4",
     "all_l4",
@@ -105,6 +110,8 @@ _LEGACY_SELECTION_MODES = {
     "all_hits",
     "classic",
 }
+_STRUCTURAL_L4_TRIGGERS = {"spring", "lps", "compression", "compress", "trend_pullback"}
+_NAKED_RIGHT_SIDE_TRIGGERS = {"sos", "evr"}
 
 
 @dataclass
@@ -413,6 +420,27 @@ def _track_map_for_hits(
     return track_map
 
 
+def _trigger_sets_by_code(triggers: dict[str, list[tuple[str, float]]]) -> dict[str, set[str]]:
+    out: dict[str, set[str]] = {}
+    for trigger, pairs in triggers.items():
+        key = str(trigger).strip().lower()
+        if not key:
+            continue
+        for code, _ in pairs:
+            c = str(code).strip()
+            if c:
+                out.setdefault(c, set()).add(key)
+    return out
+
+
+def _is_tradeable_l4_trigger_combo(trigger_keys: set[str]) -> bool:
+    if not trigger_keys:
+        return False
+    if trigger_keys & _STRUCTURAL_L4_TRIGGERS:
+        return True
+    return not trigger_keys <= _NAKED_RIGHT_SIDE_TRIGGERS
+
+
 def _select_ai_input_codes(
     *,
     result: FunnelResult,
@@ -423,7 +451,8 @@ def _select_ai_input_codes(
 ) -> tuple[list[str], dict[str, float], dict[str, str]]:
     """
     按线上漏斗口径选出“送给 AI 的候选池”：
-    - legacy_full_hits：全量 L4 命中，按触发分值排序
+    - tradeable_l4：只回放结构型 L4，剔除裸 SOS/EVR 追高噪声
+    - all_formal_l4 / legacy_full_hits：全量 L4 命中，按触发分值排序
     - modern quotas：L3 排序 + allocate_ai_candidates 动态配额
     返回 (selected_codes, priority_score_map, track_map)
     """
@@ -433,6 +462,14 @@ def _select_ai_input_codes(
         merged_trigger_map.keys(),
         key=lambda c: -hit_score_map.get(c, 0.0),
     )
+
+    if selection_mode in _TRADEABLE_L4_SELECTION_MODES:
+        trigger_sets = _trigger_sets_by_code(result.triggers)
+        selected_codes = [
+            code for code in sorted_hit_codes if _is_tradeable_l4_trigger_combo(trigger_sets.get(code, set()))
+        ]
+        score_map = {code: hit_score_map.get(code, 0.0) for code in selected_codes}
+        return selected_codes, score_map, _track_map_for_hits(selected_codes, result.triggers)
 
     if selection_mode in _FORMAL_L4_SELECTION_MODES or selection_mode in _LEGACY_SELECTION_MODES:
         return sorted_hit_codes, hit_score_map, _track_map_for_hits(sorted_hit_codes, result.triggers)
@@ -1056,13 +1093,13 @@ def run_backtest(
                 merged = list(selected_for_ai) + [c for c in confirmed_codes if c not in seen]
             if not merged:
                 continue
-            ranked_codes = merged if int(top_n) <= 0 else merged[:top_n]
+            ranked_codes = merged
             p_score_map.update(confirmed_score_map)
             track_map.update(confirmed_track_map)
         else:
             if not selected_for_ai:
                 continue
-            ranked_codes = selected_for_ai if int(top_n) <= 0 else selected_for_ai[:top_n]
+            ranked_codes = selected_for_ai
 
         if regime_filter and ranked_codes:
             ranked_codes = _apply_regime_position_filter(ranked_codes, str(regime))
@@ -1071,6 +1108,11 @@ def run_backtest(
 
         if abc_filter and ranked_codes:
             ranked_codes = _apply_abc_filter(ranked_codes, day_df_map, result.triggers)
+            if not ranked_codes:
+                continue
+
+        if int(top_n) > 0:
+            ranked_codes = ranked_codes[: int(top_n)]
             if not ranked_codes:
                 continue
 

@@ -32,6 +32,37 @@ def test_all_formal_l4_selection_excludes_stage_only_candidates() -> None:
     assert track_map == {"000001": "Trend"}
 
 
+def test_tradeable_l4_selection_drops_naked_right_side_noise() -> None:
+    result = FunnelResult(
+        layer1_symbols=[],
+        layer2_symbols=[],
+        layer3_symbols=[],
+        top_sectors=[],
+        triggers={
+            "sos": [("000001", 5.0), ("000003", 4.0), ("000005", 1.0)],
+            "evr": [("000002", 3.0), ("000003", 3.0)],
+            "lps": [("000004", 2.0)],
+            "spring": [("000005", 1.5)],
+            "compression": [("000006", 1.0)],
+        },
+        stage_map={},
+        markup_symbols=[],
+        exit_signals={},
+        channel_map={},
+    )
+
+    codes, score_map, _ = _select_ai_input_codes(
+        result=result,
+        day_df_map={},
+        sector_map={},
+        regime="RISK_ON",
+        selection_mode="tradeable_l4",
+    )
+
+    assert codes == ["000004", "000005", "000006"]
+    assert score_map == {"000004": 2.0, "000005": 1.5, "000006": 1.0}
+
+
 def test_regime_position_filter_blocks_defensive_regimes() -> None:
     codes = ["A", "B", "C", "D"]
 
