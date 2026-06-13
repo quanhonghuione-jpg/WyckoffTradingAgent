@@ -2143,14 +2143,6 @@ def run(
         if etf_metrics or etf_candidates:
             lines.append("")
 
-        # ── 命中列表：按信号分组 ──
-        def _score_star(s: float) -> str:
-            if s >= 10:
-                return "★★"
-            if s >= 5:
-                return "★ "
-            return "  "
-
         # 1) 多信号共振组（置顶）
         multi_signal = [
             c for c in selected_for_ai if c not in strategic_l2_bypass_set and len(code_to_trigger_keys.get(c, [])) > 1
