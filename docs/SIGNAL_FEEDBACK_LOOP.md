@@ -142,6 +142,18 @@ registry 只负责控制动态策略是否使用信号；原始 observations 仍
 
 这些字段和 `springboard_*` 一起落库，后续由 `signal_outcomes` 验证，而不是直接把外部或人工名单推入 AI 候选池。
 
+## Intraday Tail Confirmation
+
+`signal_observations.features_json.intraday_tail_confirmation` 记录正式主漏斗候选的尾盘 1m 分钟线确认特征。它复用 tail-buy 链路里的 VWAP、尾段量能、尾盘聪明钱和尾盘规则评分，用来复盘“日线候选在收盘前是否被分钟线确认”：
+
+- `tail_score` / `tail_decision`：按尾盘规则得到的 BUY / WATCH / SKIP 观察标签。
+- `dist_vwap_pct`：尾盘最新价相对当日 VWAP 的距离。
+- `tail30_volume_share`：最后 30 根 1m 的成交量占比。
+- `smart_money_score`：尾盘量价方向相对早盘的强弱。
+- `last30_ret_pct` / `last15_ret_pct`：尾段价格动量。
+
+这部分只写入 `features_json` 做 outcome 复盘，不改变主漏斗候选、AI 候选池、loss guard 或 Step4。
+
 ## Shadow 复盘怎么看
 
 Shadow 模式不会影响真实推荐。它的价值是回答三个问题：

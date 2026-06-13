@@ -53,6 +53,7 @@ flowchart TD
 - 默认 registry 判断使用 10 日窗口。
 - 样本不足时不贸然退役，只降低权重或保持实验态。
 - `features_json.price_action_footprint` 记录承接、缩量、突破质量、派发压力和失败突破标签，用于把“主力痕迹”从主观描述变成可回测特征。
+- `features_json.intraday_tail_confirmation` 记录正式候选的尾盘 1m VWAP、尾段量能、聪明钱和尾盘确认分，用于验证日线候选是否被尾盘分钟线确认；当前只做复盘特征，不参与候选排序。
 
 ## 方向二：多策略动态分配
 

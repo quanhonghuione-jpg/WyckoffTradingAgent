@@ -89,6 +89,26 @@ def test_candidate_rows_keep_raw_trigger_strength():
     assert rows[0]["latest_trade_date"] == 20250101
 
 
+def test_notify_report_sends_feishu(monkeypatch):
+    captured: dict[str, str] = {}
+    monkeypatch.setenv("FEISHU_WEBHOOK_URL", "https://example.invalid/webhook")
+    monkeypatch.setattr(
+        market_job,
+        "send_feishu_notification",
+        lambda webhook, title, content: (
+            captured.update({"webhook": webhook, "title": title, "content": content}) or True
+        ),
+    )
+
+    market_job._notify_report({"label": "美股", "market": "us"}, "# report")
+
+    assert captured == {
+        "webhook": "https://example.invalid/webhook",
+        "title": "Wyckoff Funnel 美股 报告",
+        "content": "# report",
+    }
+
+
 def test_upsert_funnel_to_tracking_uses_market_trade_date(monkeypatch):
     captured: dict[str, object] = {}
 

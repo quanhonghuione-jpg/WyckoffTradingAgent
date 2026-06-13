@@ -2,7 +2,7 @@
 阶段 4：私人账户再平衡决策（OMS 重构版）
 1) LLM 只输出结构化动作 JSON
 2) Python 订单管理引擎负责仓位/手数/风险计算
-3) 输出标准交易工单并推送 Telegram
+3) 输出标准交易工单并推送 Telegram / Feishu
 """
 
 from __future__ import annotations
@@ -50,6 +50,7 @@ from tools.data_fetcher import (
     latest_trade_date_from_hist as _latest_trade_date_from_hist,
 )
 from tools.report_builder import _extract_json_block
+from utils.feishu import send_feishu_notification
 from utils.notify import send_to_telegram
 from utils.trading_clock import CN_TZ, resolve_end_calendar_day
 
@@ -1609,6 +1610,26 @@ def _render_trade_ticket(
     return "\n".join(lines)
 
 
+def _send_feishu_trade_ticket(report: str) -> None:
+    webhook = os.getenv("FEISHU_WEBHOOK_URL", "").strip()
+    if not webhook:
+        print("[step4] FEISHU_WEBHOOK_URL 未配置，跳过 Step4 飞书发送")
+        return
+    ok = send_feishu_notification(webhook, "Alpha-OMS 交易执行工单", report)
+    print(f"[step4] Feishu: {'ok' if ok else 'failed'}")
+
+
+def _send_trade_ticket(report: str, tg_bot_token: str, tg_chat_id: str) -> bool:
+    sent = send_to_telegram(
+        report,
+        tg_bot_token=tg_bot_token,
+        tg_chat_id=tg_chat_id,
+    )
+    if sent:
+        _send_feishu_trade_ticket(report)
+    return sent
+
+
 def _build_user_message(
     *,
     benchmark_text: str,
@@ -1952,11 +1973,7 @@ def run(
         free_cash_after=free_cash_after,
         tickets=tickets,
     )
-    sent = send_to_telegram(
-        report,
-        tg_bot_token=tg_bot_token,
-        tg_chat_id=tg_chat_id,
-    )
+    sent = _send_trade_ticket(report, tg_bot_token, tg_chat_id)
     if not sent:
         return (False, "telegram_failed")
 

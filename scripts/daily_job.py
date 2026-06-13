@@ -18,6 +18,7 @@ import os
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, datetime, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 # Ensure project root is on sys.path for direct script invocation
@@ -285,6 +286,106 @@ def _build_footprint_map(step2_details: dict) -> dict[str, dict]:
     return build_price_action_footprint_map(_merge_observation_trigger_maps(step2_details), df_map)
 
 
+def _tail_confirmation_trigger_items(step2_details: dict, ai_codes: list[str]) -> list[tuple[str, str, float]]:
+    target_order: list[str] = []
+    for raw in list(step2_details.get("selected_for_ai", []) or []) + list(ai_codes or []):
+        code = str(raw or "").strip()
+        if code and code not in target_order:
+            target_order.append(code)
+    if not target_order:
+        return []
+    targets = set(target_order)
+    items: list[tuple[str, str, float]] = []
+    for signal_type, hits in (step2_details.get("review_triggers") or step2_details.get("triggers") or {}).items():
+        sig = str(signal_type or "").strip().lower()
+        if not sig:
+            continue
+        for code, raw_score in hits or []:
+            code_s = str(code or "").strip()
+            if code_s not in targets:
+                continue
+            try:
+                score = float(raw_score or 0.0)
+            except (TypeError, ValueError):
+                score = 0.0
+            items.append((sig, code_s, score))
+    return items
+
+
+def _intraday_tail_payload(
+    df_1m: Any,
+    *,
+    signal_type: str,
+    trigger_score: float,
+    daily_context: dict | None,
+) -> dict:
+    from core.tail_buy_strategy import compute_tail_features, score_tail_features
+
+    features = compute_tail_features(df_1m, daily_context=daily_context)
+    tail_score, tail_decision, reasons = score_tail_features(
+        features,
+        signal_score=trigger_score,
+        signal_type=signal_type,
+        status="pending",
+    )
+    return {
+        "version": "intraday_tail_confirmation_v1",
+        "source": "tickflow_1m",
+        "tail_score": round(float(tail_score), 1),
+        "tail_decision": tail_decision,
+        "tail_reasons": reasons[:6],
+        **features,
+    }
+
+
+def _build_intraday_tail_map(step2_details: dict, ai_codes: list[str], logs_path: str | None) -> dict[str, dict]:
+    if os.getenv("FUNNEL_INTRADAY_TAIL_CONFIRMATION", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return {}
+    api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
+    if not api_key:
+        _log("尾盘分钟线确认: 跳过（TICKFLOW_API_KEY 未配置）", logs_path)
+        return {}
+    items = _tail_confirmation_trigger_items(step2_details, ai_codes)
+    if not items:
+        return {}
+    try:
+        max_symbols = max(int(os.getenv("FUNNEL_TAIL_CONFIRMATION_MAX_SYMBOLS", "40")), 1)
+    except ValueError:
+        max_symbols = 40
+    codes = list(dict.fromkeys(code for _sig, code, _score in items))[:max_symbols]
+    allowed = set(codes)
+    try:
+        from integrations.tickflow_client import TickFlowClient, normalize_cn_symbol
+
+        symbols = [normalize_cn_symbol(code) for code in codes]
+        data_map = TickFlowClient(api_key=api_key).get_intraday_batch(symbols, period="1m", count=5000)
+        springboard_map = step2_details.get("springboard_map") or _build_springboard_map(step2_details)
+        out: dict[str, dict[str, Any]] = {}
+        for sig, code, trigger_score in items:
+            if code not in allowed:
+                continue
+            df_1m = data_map.get(normalize_cn_symbol(code))
+            if df_1m is None or df_1m.empty:
+                continue
+            springboard = springboard_map.get(f"{sig}:{code}") or springboard_map.get(code) or {}
+            support = springboard.get("springboard_support")
+            daily_context = {"support_level": support} if support else None
+            payload = _intraday_tail_payload(
+                df_1m,
+                signal_type=sig,
+                trigger_score=trigger_score,
+                daily_context=daily_context,
+            )
+            out[f"{sig}:{code}"] = payload
+            out.setdefault(code, payload)
+        feature_count = sum(1 for key in out if ":" in key)
+        _log(f"尾盘分钟线确认: requested={len(codes)}, features={feature_count}", logs_path)
+        return out
+    except Exception as e:
+        _log(f"尾盘分钟线确认失败（已降级）: {e}", logs_path)
+        return {}
+
+
 def _observation_context(step2_details: dict) -> tuple[dict, dict, dict, dict, dict, dict, dict, dict]:
     metrics = step2_details.get("metrics", {}) or {}
     footprint_map = step2_details.get("footprint_map")
@@ -327,6 +428,7 @@ def _build_signal_observation_rows(
         _observation_context(step2_details)
     )
     selected_for_ai = step2_details.get("selected_for_ai", []) or []
+    intraday_tail_map = step2_details.get("intraday_tail_map") or {}
     return build_signal_observations(
         _latest_trade_date_str(),
         step2_details.get("review_triggers") or step2_details.get("triggers") or {},
@@ -342,6 +444,7 @@ def _build_signal_observation_rows(
         source_map=_signal_observation_source_map(step2_details),
         springboard_map=springboard_map,
         footprint_map=footprint_map,
+        intraday_tail_map=intraday_tail_map,
         selection_mode=os.getenv("FUNNEL_AI_SELECTION_MODE", "quota"),
         policy_version=f"dynamic:{os.getenv('FUNNEL_DYNAMIC_POLICY', 'off')}",
         rank_map={str(code): idx + 1 for idx, code in enumerate(selected_for_ai)},
@@ -355,6 +458,7 @@ def _build_shadow_observation_rows(step2_details: dict, regime: str) -> list[dic
     if not shadow_triggers:
         return []
     _, name_map, sector_map, stage_map, channel_map, close_map, _, footprint_map = _observation_context(step2_details)
+    intraday_tail_map = step2_details.get("intraday_tail_map") or {}
     return build_signal_observations(
         _latest_trade_date_str(),
         shadow_triggers,
@@ -367,6 +471,7 @@ def _build_shadow_observation_rows(step2_details: dict, regime: str) -> list[dic
         latest_close_map=close_map,
         source_map=shadow_source_map,
         footprint_map=footprint_map,
+        intraday_tail_map=intraday_tail_map,
         selection_mode="shadow",
         policy_version=f"dynamic:{os.getenv('FUNNEL_DYNAMIC_POLICY', 'off')}",
     )
@@ -378,6 +483,7 @@ def _build_external_seed_signal_rows(step2_details: dict, regime: str) -> list[d
     metrics, name_map, sector_map, stage_map, channel_map, close_map, springboard_map, footprint_map = (
         _observation_context(step2_details)
     )
+    intraday_tail_map = step2_details.get("intraday_tail_map") or {}
     selected = {str(code).strip() for code in step2_details.get("selected_for_ai", []) if str(code).strip()}
     triggers = {
         signal_type: [(code, score) for code, score in hits if str(code).strip() not in selected]
@@ -401,6 +507,7 @@ def _build_external_seed_signal_rows(step2_details: dict, regime: str) -> list[d
         source_map=source_map,
         springboard_map=springboard_map,
         footprint_map=footprint_map,
+        intraday_tail_map=intraday_tail_map,
         selection_mode="external_seed_shadow",
         policy_version=f"external_seed:{metrics.get('external_seed_source') or 'external'}",
     )
@@ -439,6 +546,8 @@ def _persist_signal_observations(
         from integrations.supabase_signal_feedback import upsert_signal_observations
 
         regime = str((benchmark_context or {}).get("regime") or "NEUTRAL")
+        if "intraday_tail_map" not in step2_details:
+            step2_details["intraday_tail_map"] = _build_intraday_tail_map(step2_details, ai_codes, logs_path)
         rows = _build_signal_observation_rows(step2_details, regime, ai_codes)
         rows.extend(_build_shadow_observation_rows(step2_details, regime))
         rows.extend(_build_external_seed_signal_rows(step2_details, regime))

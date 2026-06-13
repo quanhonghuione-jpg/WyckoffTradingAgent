@@ -2,7 +2,7 @@
 TickFlow 港股/美股 Wyckoff 漏斗任务。
 
 流程：标的池实时行情 -> 流动性预筛 -> 批量历史日 K -> Wyckoff 漏斗。
-结果仅写入本地 JSON artifact，不写数据库。
+结果写入本地 artifact，可选写入推荐跟踪，并在配置飞书 webhook 时推送报告。
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from core.wyckoff_engine import (
 from integrations.tickflow_client import TickFlowClient
 from integrations.tickflow_notice import TICKFLOW_UPGRADE_URL
 from tools.candidate_ranker import TRIGGER_LABELS
+from utils.feishu import send_feishu_notification
 
 
 @dataclass(frozen=True)
@@ -452,10 +453,21 @@ def _write_report(path: Path | None, result: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(report, encoding="utf-8")
         print(f"[market-funnel] report written: {path}")
+    _notify_report(result, report)
     summary_path = os.getenv("GITHUB_STEP_SUMMARY", "").strip()
     if summary_path:
         with Path(summary_path).open("a", encoding="utf-8") as fh:
             fh.write(report + "\n")
+
+
+def _notify_report(result: dict[str, Any], report: str) -> None:
+    webhook = os.getenv("FEISHU_WEBHOOK_URL", "").strip()
+    if not webhook:
+        print("[market-funnel] FEISHU_WEBHOOK_URL 未配置，跳过飞书发送")
+        return
+    title = f"Wyckoff Funnel {result.get('label', result.get('market', ''))} 报告".strip()
+    ok = send_feishu_notification(webhook, title, report)
+    print(f"[market-funnel] 飞书发送{'成功' if ok else '失败'}")
 
 
 def _require_tickflow_client() -> TickFlowClient:

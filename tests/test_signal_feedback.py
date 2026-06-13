@@ -12,6 +12,28 @@ from core.signal_feedback import build_signal_observations, build_signal_registr
 from scripts.signal_feedback_job import _default_registry_horizon, _outcome_rows
 
 
+def _make_intraday_df(*, start: float = 10.0, end: float = 10.9, bars: int = 180) -> pd.DataFrame:
+    idx = pd.date_range("2026-06-10 09:30", periods=bars, freq="1min", tz="Asia/Shanghai")
+    close = pd.Series([start + (end - start) * i / max(bars - 1, 1) for i in range(bars)])
+    tail_n = min(30, bars)
+    close.iloc[-tail_n:] = (
+        close.iloc[-tail_n:].to_numpy() + pd.Series([0.5 * (i + 1) / tail_n for i in range(tail_n)]).to_numpy()
+    )
+    volume = pd.Series([1200.0] * bars)
+    volume.iloc[-tail_n:] = volume.iloc[-tail_n:] * 1.8
+    return pd.DataFrame(
+        {
+            "datetime": idx,
+            "open": close.shift(1).fillna(close.iloc[0]).values,
+            "high": (close * 1.003).values,
+            "low": (close * 0.997).values,
+            "close": close.values,
+            "volume": volume.values,
+            "amount": (close * volume).values,
+        }
+    )
+
+
 class _FailingUpsertQuery:
     def upsert(self, _rows: list[dict], *, on_conflict: str):
         return self
@@ -117,6 +139,16 @@ def test_build_signal_observations_marks_selection_and_source():
                 "springboard_evidence": {"c_support": {"touch_dates": ["2026-05-20"]}},
             },
         },
+        intraday_tail_map={
+            "sos:000001": {
+                "version": "intraday_tail_confirmation_v1",
+                "tail_score": 78.5,
+                "tail_decision": "BUY",
+                "dist_vwap_pct": 1.2,
+                "smart_money_score": 3.4,
+                "tail30_volume_share": 0.22,
+            }
+        },
     )
 
     first = rows[0]
@@ -132,10 +164,65 @@ def test_build_signal_observations_marks_selection_and_source():
     assert first["springboard_evidence"]["a_hits"][0]["date"] == "2026-05-24"
     assert first["features_json"]["price_action_footprint"]["tags"] == ["quality_breakout"]
     assert first["features_json"]["springboard"]["springboard_grade"] == "A+B"
+    assert first["features_json"]["intraday_tail_confirmation"]["tail_decision"] == "BUY"
+    assert first["features_json"]["intraday_tail_confirmation"]["smart_money_score"] == 3.4
     assert second["track"] == "Accum"
     assert second["source"] == "l2_bypass"
     assert second["springboard_grade"] == "C"
     assert second["springboard_c"] is True
+
+
+def test_daily_job_builds_intraday_tail_confirmation_map(monkeypatch):
+    from integrations import tickflow_client
+    from scripts import daily_job
+
+    class FakeTickFlow:
+        def __init__(self, api_key: str):
+            assert api_key == "tf-key"
+
+        def get_intraday_batch(self, symbols: list[str], *, period: str, count: int):
+            assert symbols == ["000001.SZ"]
+            assert period == "1m"
+            assert count == 5000
+            return {"000001.SZ": _make_intraday_df()}
+
+    monkeypatch.setenv("TICKFLOW_API_KEY", "tf-key")
+    monkeypatch.setenv("FUNNEL_INTRADAY_TAIL_CONFIRMATION", "1")
+    monkeypatch.setenv("FUNNEL_TAIL_CONFIRMATION_MAX_SYMBOLS", "1")
+    monkeypatch.setattr(tickflow_client, "TickFlowClient", FakeTickFlow)
+
+    got = daily_job._build_intraday_tail_map(
+        {
+            "selected_for_ai": ["000001", "000002"],
+            "review_triggers": {"sos": [("000001", 6.0), ("000002", 5.0)]},
+            "springboard_map": {"sos:000001": {"springboard_support": 10.0}},
+        },
+        [],
+        None,
+    )
+
+    assert "sos:000001" in got
+    assert "sos:000002" not in got
+    assert got["sos:000001"]["version"] == "intraday_tail_confirmation_v1"
+    assert got["sos:000001"]["source"] == "tickflow_1m"
+    assert got["sos:000001"]["bars"] == 180
+    assert got["sos:000001"]["tail_score"] > 0
+    assert got["000001"]["tail_decision"] in {"BUY", "WATCH", "SKIP"}
+
+
+def test_daily_job_intraday_tail_map_skips_without_tickflow_key(monkeypatch):
+    from scripts import daily_job
+
+    monkeypatch.delenv("TICKFLOW_API_KEY", raising=False)
+    monkeypatch.setenv("FUNNEL_INTRADAY_TAIL_CONFIRMATION", "1")
+
+    got = daily_job._build_intraday_tail_map(
+        {"selected_for_ai": ["000001"], "review_triggers": {"sos": [("000001", 6.0)]}},
+        [],
+        None,
+    )
+
+    assert got == {}
 
 
 def test_price_action_footprint_marks_breakout_and_supply_pressure():
