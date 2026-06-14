@@ -17,7 +17,10 @@ export const authMiddleware = createMiddleware<{
   }
 
   const token = authHeader.slice(7)
-  const supabase = createClient(c.env.SUPABASE_URL, c.env.SUPABASE_ANON_KEY)
+  const url = c.env.SUPABASE_URL || c.env.VITE_SUPABASE_URL
+  const anonKey = c.env.SUPABASE_ANON_KEY || c.env.VITE_SUPABASE_ANON_KEY
+  if (!url || !anonKey) return c.json({ error: 'Supabase env is missing' }, 500)
+  const supabase = createClient(url, anonKey)
 
   const { data: { user }, error } = await supabase.auth.getUser(token)
   if (error || !user) {
