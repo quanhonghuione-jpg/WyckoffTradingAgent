@@ -660,8 +660,9 @@ def _run_signal_confirmation(
     logs_path: str | None,
     *,
     dry_run: bool = False,
-) -> None:
+) -> list[dict]:
     """Step2.5: pending 信号确认，confirmed 追加到 symbols_info。"""
+    confirmed_extra: list[dict] = []
     try:
         from integrations.supabase_signal_pending import run_step2_5
 
@@ -688,12 +689,19 @@ def _run_signal_confirmation(
                     continue
                 existing = existing_by_code.get(code)
                 if existing is not None:
-                    existing.update({k: v for k, v in cs.items() if v not in (None, "")})
+                    for key, value in cs.items():
+                        if value in (None, ""):
+                            continue
+                        if key == "selection_source" and str(existing.get("selection_source", "")).strip():
+                            continue
+                        existing[key] = value
                 else:
                     symbols_info.append(cs)
                     existing_by_code[code] = cs
+            step2_details["signal_confirmed_selected"] = confirmed_extra
     except Exception as e:
         _log(f"Step2.5 信号确认失败（已降级）: {e}", logs_path)
+    return confirmed_extra
 
 
 def _run_springboard_scoring(

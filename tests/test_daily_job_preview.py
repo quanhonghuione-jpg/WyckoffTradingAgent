@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 from datetime import date
 
+import pandas as pd
+
 
 def test_preview_only_skips_persistence_and_keeps_llm_input_path(monkeypatch, tmp_path):
     import core.batch_report as batch_report
@@ -33,10 +35,19 @@ def test_preview_only_skips_persistence_and_keeps_llm_input_path(monkeypatch, tm
 
     def fake_run_step2_5(*_args, dry_run=False, **_kwargs):
         captured["signal_dry_run"] = dry_run
-        return [{"code": "000002", "name": "万科A", "tag": "pending confirmed"}]
+        return [
+            {
+                "code": "000002",
+                "name": "万科A",
+                "tag": "EVR(二次确认)",
+                "selection_source": "signal_confirmed",
+                "confirm_reason": "守住 10.00",
+            }
+        ]
 
     def fake_run_step3(symbols_info, webhook_url, *_args, **_kwargs):
         captured["step3_symbols"] = [item["code"] for item in symbols_info]
+        captured["step3_items"] = symbols_info
         captured["step3_webhook"] = webhook_url
         return True, "ok_preview", "# Step3 模型输入预演"
 
@@ -65,6 +76,8 @@ def test_preview_only_skips_persistence_and_keeps_llm_input_path(monkeypatch, tm
     assert captured["signal_dry_run"] is True
     assert captured["step3_webhook"] == "https://example.invalid/webhook"
     assert captured["step3_symbols"] == ["000001", "000002"]
+    assert captured["step3_items"][1]["selection_source"] == "signal_confirmed"
+    assert captured["step3_items"][1]["confirm_reason"] == "守住 10.00"
 
 
 def test_non_trading_skip_message_allows_when_next_day_trades(monkeypatch):
@@ -125,6 +138,31 @@ def test_signal_confirmation_dry_run_does_not_write(monkeypatch):
 
     assert confirmed == [{"code": "000001"}]
     assert writes == []
+
+
+def test_step3_confirmed_preview_lists_signal_pending_source():
+    import scripts.step3_batch_report as step3
+
+    preview = step3._build_signal_confirmed_preview(
+        pd.DataFrame(
+            [
+                {
+                    "code": "603039",
+                    "name": "泛微网络",
+                    "input_order": 0,
+                    "signal_status": "confirmed",
+                    "signal_type": "evr",
+                    "signal_date": "2026-06-11",
+                    "confirm_date": "2026-06-12",
+                    "confirm_reason": "守住 44.01，收盘 47.61",
+                }
+            ]
+        )
+    )
+
+    assert "二次确认补充" in preview
+    assert "603039 泛微网络" in preview
+    assert "2026-06-11 → 2026-06-12" in preview
 
 
 def test_shadow_observation_inputs_build_added_and_removed_sources():

@@ -520,6 +520,59 @@ def _coerce_bool_like(value: object) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+SOURCE_LABELS = {
+    "l4_hit": "今日漏斗",
+    "l2_bypass": "L2旁路",
+    "strategic_l2_bypass": "战略旁路",
+    "l3_fill": "L3补位",
+    "markup": "Markup补位",
+    "accum_c": "Accum_C补位",
+    "signal_confirmed": "二次确认",
+}
+
+
+def _clean_text(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
+
+
+def _candidate_source_label(row: pd.Series) -> str:
+    source = _clean_text(row.get("selection_source"))
+    label = SOURCE_LABELS.get(source, source)
+    confirmed = _clean_text(row.get("signal_status")).lower() == "confirmed"
+    if confirmed and label and label != "二次确认":
+        return f"{label}+二次确认"
+    if confirmed:
+        return "二次确认"
+    return label
+
+
+def _build_signal_confirmed_preview(selected_df: pd.DataFrame) -> str:
+    if selected_df is None or selected_df.empty or "signal_status" not in selected_df.columns:
+        return ""
+    mask = selected_df["signal_status"].astype(str).str.lower().eq("confirmed")
+    confirmed_df = selected_df[mask].copy()
+    if confirmed_df.empty:
+        return ""
+
+    lines = ["## ✅ 二次确认补充（前置）"]
+    for _, row in confirmed_df.sort_values("input_order", kind="stable").iterrows():
+        code = _clean_text(row.get("code"))
+        name = _clean_text(row.get("name")) or code
+        signal_type = _clean_text(row.get("signal_type")) or _clean_text(row.get("tag")) or "-"
+        signal_date = _clean_text(row.get("signal_date")) or "-"
+        confirm_date = _clean_text(row.get("confirm_date")) or "-"
+        reason = _clean_text(row.get("confirm_reason")) or "确认条件已满足"
+        lines.append(f"- {code} {name} | {signal_type} | {signal_date} → {confirm_date} | {reason}")
+    return "\n".join(lines) + "\n\n---\n"
+
+
 def _resolve_step3_context_cap(raw_count: int) -> int:
     raw_n = max(int(raw_count), 0)
     if raw_n <= 0:
@@ -908,6 +961,12 @@ def run(
                     "priority_rank": pd.to_numeric(item.get("priority_rank"), errors="coerce"),
                     "selection_source": str(item.get("selection_source", "") or "").strip(),
                     "selection_is_fill": _coerce_bool_like(item.get("selection_is_fill")),
+                    "source_type": str(item.get("source_type", "") or "").strip(),
+                    "signal_status": str(item.get("signal_status", "") or "").strip(),
+                    "signal_type": str(item.get("signal_type", "") or "").strip(),
+                    "signal_date": str(item.get("signal_date", "") or "").strip(),
+                    "confirm_date": str(item.get("confirm_date", "") or "").strip(),
+                    "confirm_reason": str(item.get("confirm_reason", "") or "").strip(),
                     "exit_signal": str(item.get("exit_signal", "")).strip(),
                     "exit_price": pd.to_numeric(item.get("exit_price"), errors="coerce"),
                     "exit_reason": str(item.get("exit_reason", "")).strip(),
@@ -1155,10 +1214,14 @@ def run(
         _exit_price_raw = pd.to_numeric(row.get("exit_price"), errors="coerce")
         _exit_price = float(_exit_price_raw) if pd.notna(_exit_price_raw) else None
         _exit_reason = str(row.get("exit_reason", "")).strip() or None
+        source_label = _candidate_source_label(row)
+        wyckoff_tag = str(row.get("tag", "")).strip()
+        if source_label:
+            wyckoff_tag = f"[{source_label}] {wyckoff_tag}".strip()
         payload = generate_stock_payload(
             stock_code=code,
             stock_name=str(row.get("name", code)),
-            wyckoff_tag=str(row.get("tag", "")),
+            wyckoff_tag=wyckoff_tag,
             df=df,
             industry=str(row.get("industry", "")),
             market_cap_yi=pd.to_numeric(row.get("market_cap_yi"), errors="coerce"),
@@ -1330,8 +1393,9 @@ def run(
                 ops_codes.append(code)
     ops_lines = [f"- {c} {code_name.get(c, c)}" for c in ops_codes]
     ops_preview = "## 🏹 处于起跳板速览（前置）\n" + ("\n".join(ops_lines) if ops_lines else "- 无") + "\n\n---\n"
+    signal_confirmed_preview = _build_signal_confirmed_preview(selected_df)
 
-    content = f"{rag_veto_preview}{ops_preview}{SPRINGBOARD_ABC_LEGEND}\n{report}"
+    content = f"{rag_veto_preview}{signal_confirmed_preview}{ops_preview}{SPRINGBOARD_ABC_LEGEND}\n{report}"
     if rag_veto_lines:
         content += "\n\n## 🛑 RAG 防雷剔除清单\n" + "\n".join(rag_veto_lines)
     print(f"[step3] 飞书发送原文长度={len(content)}（不压缩，交由飞书分片）")
