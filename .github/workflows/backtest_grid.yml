@@ -16,7 +16,7 @@ on:
           - "bull_2020"
           - "bear_2022"
           - "custom"
-        default: "recent_6m"
+        default: "all_defined"
       start:
         description: "自定义起始日期 (YYYY-MM-DD)，仅 period=custom 时生效"
         required: false
@@ -25,59 +25,6 @@ on:
         description: "自定义结束日期 (YYYY-MM-DD)，仅 period=custom 时生效"
         required: false
         default: ""
-      top_n:
-        description: "每日选股 TopN"
-        required: true
-        default: "4"
-      board:
-        description: "股票池"
-        required: true
-        default: "main_chinext"
-      sample_size:
-        description: "股票池采样，0 表示全量"
-        required: true
-        default: "0"
-      trading_days:
-        description: "回看交易日数"
-        required: true
-        default: "320"
-      trailing_stop:
-        description: "移动止盈(%), 如 -5 表示从最高点回撤5%卖出, 0=关闭"
-        required: true
-        default: "0"
-      entry_price_mode:
-        description: "入场价格口径"
-        required: true
-        type: choice
-        options:
-          - "open"
-          - "tail_1455"
-        default: "open"
-      entry_price_time:
-        description: "分钟线入场时间，仅 entry_price_mode=tail_1455 生效"
-        required: true
-        default: "14:55"
-      entry_price_fallback:
-        description: "tail_1455 缺分钟线时的处理：close=回退日收盘, skip=跳过, error=失败"
-        required: true
-        type: choice
-        options:
-          - "close"
-          - "skip"
-          - "error"
-        default: "close"
-      initial_cash:
-        description: "现金账户初始资金"
-        required: true
-        default: "100000"
-      max_positions:
-        description: "最多同时持仓数量"
-        required: true
-        default: "4"
-      portfolio_styles:
-        description: "现金账户交易风格，all_core=等额/补仓/确认/金字塔/集中换股"
-        required: true
-        default: "all_core"
 
 concurrency:
   group: backtest-grid-${{ github.ref }}
@@ -89,17 +36,14 @@ permissions:
 env:
   BT_START: ${{ inputs.start }}
   BT_END: ${{ inputs.end }}
-  BT_TOP_N: ${{ inputs.top_n || '4' }}
-  BT_BOARD: ${{ inputs.board || 'main_chinext' }}
-  BT_SAMPLE_SIZE: ${{ inputs.sample_size || '0' }}
-  BT_TRADING_DAYS: ${{ inputs.trading_days || '320' }}
-  BT_TRAILING_STOP: ${{ inputs.trailing_stop || '0' }}
-  BT_ENTRY_PRICE_MODE: ${{ inputs.entry_price_mode || 'open' }}
-  BT_ENTRY_PRICE_TIME: ${{ inputs.entry_price_time || '14:55' }}
-  BACKTEST_ENTRY_PRICE_FALLBACK: ${{ inputs.entry_price_fallback || 'close' }}
-  BT_INITIAL_CASH: ${{ inputs.initial_cash || '100000' }}
-  BT_MAX_POSITIONS: ${{ inputs.max_positions || '4' }}
-  BT_PORTFOLIO_STYLES: ${{ inputs.portfolio_styles || 'all_core' }}
+  BT_TOP_N: "4"
+  BT_BOARD: "main_chinext"
+  BT_SAMPLE_SIZE: "0"
+  BT_TRADING_DAYS: "320"
+  BT_ENTRY_PRICE_MODE: "open"
+  BT_INITIAL_CASH: "100000"
+  BT_MAX_POSITIONS: "4"
+  BT_PORTFOLIO_STYLES: "all_core"
   BT_COMMISSION_RATE: "0.0002"
   BT_SMALL_TRADE_THRESHOLD: "10000"
   BT_SMALL_TRADE_FEE: "5"
@@ -334,8 +278,6 @@ jobs:
               --regime-filter \
               --abc-filter \
               --entry-price-mode "${BT_ENTRY_PRICE_MODE}" \
-              --entry-price-time "${BT_ENTRY_PRICE_TIME}" \
-              --entry-price-fallback "${BACKTEST_ENTRY_PRICE_FALLBACK}" \
               --cash-portfolio \
               --initial-cash "${BT_INITIAL_CASH}" \
               --max-positions "${BT_MAX_POSITIONS}" \
@@ -442,7 +384,7 @@ jobs:
       - name: Aggregate and notify
         shell: bash
         env:
-          BT_TOP_N: ${{ inputs.top_n || '4' }}
+          BT_TOP_N: "4"
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python3 -u - <<'PYEOF'
