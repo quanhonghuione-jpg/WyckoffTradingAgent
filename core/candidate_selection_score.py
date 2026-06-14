@@ -123,11 +123,7 @@ def _springboard_component(springboard: dict[str, Any]) -> tuple[float, list[str
     if not springboard:
         return 0.0, []
     met_count = max(0.0, min(3.0, _num(springboard.get("springboard_met_count"))))
-    bool_hits = sum(
-        1
-        for key in ("springboard_a", "springboard_b", "springboard_c")
-        if bool(springboard.get(key))
-    )
+    bool_hits = sum(1 for key in ("springboard_a", "springboard_b", "springboard_c") if bool(springboard.get(key)))
     quality = max(met_count, float(bool_hits)) / 3.0 * 100.0
     component = _points(quality, 18.0)
     tags = []

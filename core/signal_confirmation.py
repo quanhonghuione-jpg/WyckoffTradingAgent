@@ -37,12 +37,7 @@ def _confirm_sos(snap: dict, today: dict, days_elapsed: int) -> tuple[str, str]:
         return "expired", f"跌破信号日低点 {snap_low:.2f}"
     if snap_vol > 0 and today["volume"] > snap_vol * 0.8 and today["close"] < snap_close * 0.97:
         return "expired", "放量回落，非缩量确认"
-    if (
-        snap_vol > 0
-        and today["volume"] < snap_vol * 0.8
-        and today["low"] >= snap_low
-        and today["close"] >= snap_close
-    ):
+    if snap_vol > 0 and today["volume"] < snap_vol * 0.8 and today["low"] >= snap_low and today["close"] >= snap_close:
         return "confirmed", f"缩量确认，收盘 {today['close']:.2f} 守住信号日收盘 {snap_close:.2f}"
     return "pending", "等待缩量确认"
 
