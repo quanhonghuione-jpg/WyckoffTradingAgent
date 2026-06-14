@@ -164,18 +164,27 @@ function ChatMessages({ chat, loading, scrollRef, onPick }: {
   scrollRef: React.RefObject<HTMLDivElement | null>
   onPick: (value: string) => void
 }) {
+  const activeAssistantId = loading ? lastAssistantId(chat.messages) : null
   return (
     <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto px-6 py-4">
       {chat.messages.length === 0 && !loading ? (
         <EmptyChat onPick={onPick} />
       ) : (
         <div className="space-y-4 pb-2">
-          {chat.messages.map((message) => <MessageBubble key={message.id} message={message} approve={(id) => void chat.addToolApprovalResponse({ id, approved: true })} deny={(id) => void chat.addToolApprovalResponse({ id, approved: false })} />)}
+          {chat.messages.map((message) => <MessageBubble key={message.id} message={message} isActive={message.id === activeAssistantId} approve={(id) => void chat.addToolApprovalResponse({ id, approved: true })} deny={(id) => void chat.addToolApprovalResponse({ id, approved: false })} />)}
           {loading && <ThinkingBubble />}
         </div>
       )}
     </div>
   )
+}
+
+function lastAssistantId(messages: UIMessage[]): string | null {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message?.role === 'assistant') return message.id
+  }
+  return null
 }
 
 function ErrorBanner({ message }: { message: string }) {
@@ -185,10 +194,12 @@ function ErrorBanner({ message }: { message: string }) {
 
 const MessageBubble = memo(function MessageBubble({
   message,
+  isActive,
   approve,
   deny,
 }: {
   message: UIMessage
+  isActive: boolean
   approve: (approvalId: string) => void
   deny: (approvalId: string) => void
 }) {
@@ -196,19 +207,19 @@ const MessageBubble = memo(function MessageBubble({
   return (
     <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
       <div className={`max-w-[82%] rounded-2xl px-4 py-2.5 text-sm ${isUser ? 'bg-primary text-primary-foreground whitespace-pre-wrap' : 'bg-muted text-foreground'}`}>
-        {isUser ? <UserText message={message} /> : <AssistantParts message={message} approve={approve} deny={deny} />}
+        {isUser ? <UserText message={message} /> : <AssistantParts message={message} isActive={isActive} approve={approve} deny={deny} />}
       </div>
     </div>
   )
 })
 
-function AssistantParts({ message, approve, deny }: { message: UIMessage; approve: (id: string) => void; deny: (id: string) => void }) {
+function AssistantParts({ message, isActive, approve, deny }: { message: UIMessage; isActive: boolean; approve: (id: string) => void; deny: (id: string) => void }) {
   const items = buildAssistantRenderItems(message.parts)
   return (
     <>
       {items.map((item) => {
         if (item.type === 'text') return <MarkdownContent key={item.key} content={item.content} />
-        if (item.type === 'tool-group') return <ToolRunSummary key={item.key} parts={item.parts} />
+        if (item.type === 'tool-group') return <ToolRunSummary key={item.key} parts={item.parts} isActive={isActive} />
         if (item.type === 'tool') return <ToolPartCard key={item.key} part={item.part} approve={approve} deny={deny} />
         return null
       })}
@@ -279,10 +290,11 @@ function ToolPartCard({ part, approve, deny }: { part: ToolPart; approve: (id: s
   )
 }
 
-function ToolRunSummary({ parts }: { parts: ToolPart[] }) {
+function ToolRunSummary({ parts, isActive }: { parts: ToolPart[]; isActive: boolean }) {
   const { t } = usePreferences()
   const labels = uniqueToolLabels(parts, t)
   const hasFailure = parts.some((part) => part.state === 'output-error')
+  const wasInterrupted = !isActive && parts.some(isRunningTool)
   return (
     <div className="my-2 rounded-md border border-border/70 bg-background/70 px-3 py-2 text-[12px] text-muted-foreground">
       <div className="flex items-center justify-between gap-3">
@@ -290,12 +302,13 @@ function ToolRunSummary({ parts }: { parts: ToolPart[] }) {
           <Wrench size={12} className="shrink-0 text-primary" />
           <span className="truncate">{toolGroupTitle(parts, t)}</span>
         </span>
-        <span className="shrink-0 text-[10px]">{toolGroupState(parts, t)}</span>
+        <span className="shrink-0 text-[10px]">{toolGroupState(parts, t, isActive)}</span>
       </div>
       <div className="mt-1.5 flex flex-wrap gap-1.5">
         {labels.map((label) => <span key={label} className="rounded-full bg-muted px-2 py-0.5 text-[11px]">{label}</span>)}
       </div>
       {hasFailure && <p className="mt-1.5 text-[11px] text-amber-700 dark:text-amber-200">{t('chat.toolPartialFailure')}</p>}
+      {wasInterrupted && <p className="mt-1.5 text-[11px] text-amber-700 dark:text-amber-200">{t('chat.toolInterruptedHint')}</p>}
     </div>
   )
 }
@@ -478,8 +491,8 @@ function toolGroupTitle(parts: ToolPart[], t: (key: TranslationKey) => string): 
   return t('chat.toolGroupDataLookup')
 }
 
-function toolGroupState(parts: ToolPart[], t: (key: TranslationKey) => string): string {
-  if (parts.some(isRunningTool)) return t('chat.toolRunning')
+function toolGroupState(parts: ToolPart[], t: (key: TranslationKey) => string, isActive: boolean): string {
+  if (parts.some(isRunningTool)) return isActive ? t('chat.toolRunning') : t('chat.toolInterrupted')
   if (parts.some((part) => part.state === 'output-error')) return t('chat.toolGroupPartial')
   return t('chat.toolDone')
 }

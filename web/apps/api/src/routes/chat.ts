@@ -56,7 +56,10 @@ chatRoutes.post('/', async (c) => {
 
   const provider = createProvider(config)
   const tools = buildTools(createToolDeps(supabase), auth.userId, config, provider.chat(config.model))
-  const modelMessages = await convertToModelMessages(messages.slice(-40), { tools })
+  const modelMessages = await convertToModelMessages(messages.slice(-40), {
+    tools,
+    ignoreIncompleteToolCalls: true,
+  })
   const result = streamText({
     model: provider.chat(config.model),
     system: WYCKOFF_CHAT_SYSTEM_PROMPT,
@@ -334,5 +337,9 @@ function patchOneRouteBody(body: BodyInit | null | undefined): BodyInit | null |
 }
 
 function normalizeStreamError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
+  const message = error instanceof Error ? error.message : String(error)
+  if (/Tool results? (are|is) missing for tool calls?/i.test(message)) {
+    return '上一次工具调用被中断，请重新发送当前问题。'
+  }
+  return message
 }
