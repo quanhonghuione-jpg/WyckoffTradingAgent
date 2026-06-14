@@ -107,7 +107,7 @@ def test_regime_position_filter_blocks_defensive_regimes() -> None:
     assert _apply_regime_position_filter(codes, "PANIC_REPAIR") == []
     assert _apply_regime_position_filter(codes, "RISK_OFF") == []
     assert _apply_regime_position_filter(codes, "NEUTRAL") == ["A", "B"]
-    assert _apply_regime_position_filter(codes, "RISK_ON") == ["A", "B"]
+    assert _apply_regime_position_filter(codes, "RISK_ON") == ["A"]
     assert _apply_regime_position_filter(codes, "BEAR_REBOUND") == ["A"]
 
 

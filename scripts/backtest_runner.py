@@ -90,14 +90,22 @@ DEFAULT_ENTRY_PRICE_FALLBACK = os.getenv("BACKTEST_ENTRY_PRICE_FALLBACK", "close
 CN_ZONE = ZoneInfo("Asia/Shanghai")
 
 # ── 大盘水温仓位控制：根据 regime 调节每日候选上限，减少逆势开仓。 ──
+def _position_ratio_env(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+    return min(max(value, 0.0), 1.0)
+
+
 REGIME_POSITION_RATIO: dict[str, float] = {
-    "NEUTRAL": 0.5,  # 震荡市 → 半仓，避免弱市噪声补满 TopN
-    "RISK_ON": 0.5,  # 风险偏好期 → 半仓，防止反弹误判时满仓追高
-    "BEAR_REBOUND": 0.25,  # 熊市反抽 → 只保留最强确认候选
-    "PANIC_REPAIR": 0.0,  # 恐慌修复 → 暂停新开仓
-    "RISK_OFF": 0.0,  # 避险 → 暂停新开仓
-    "CRASH": 0.0,  # 崩盘 → 不开仓
-    "BLACK_SWAN": 0.0,
+    "NEUTRAL": _position_ratio_env("BACKTEST_REGIME_NEUTRAL_POSITION_RATIO", 0.5),  # 震荡市 → 半仓
+    "RISK_ON": _position_ratio_env("BACKTEST_REGIME_RISK_ON_POSITION_RATIO", 0.25),  # 风险偏好期 → 只留最强确认
+    "BEAR_REBOUND": _position_ratio_env("BACKTEST_REGIME_BEAR_REBOUND_POSITION_RATIO", 0.25),  # 熊市反抽
+    "PANIC_REPAIR": _position_ratio_env("BACKTEST_REGIME_PANIC_REPAIR_POSITION_RATIO", 0.0),  # 恐慌修复
+    "RISK_OFF": _position_ratio_env("BACKTEST_REGIME_RISK_OFF_POSITION_RATIO", 0.0),  # 避险
+    "CRASH": _position_ratio_env("BACKTEST_REGIME_CRASH_POSITION_RATIO", 0.0),  # 崩盘
+    "BLACK_SWAN": _position_ratio_env("BACKTEST_REGIME_BLACK_SWAN_POSITION_RATIO", 0.0),
 }
 FUNNEL_AI_SELECTION_MODE = os.getenv("FUNNEL_AI_SELECTION_MODE", "tradeable_l4").strip().lower()
 try:
