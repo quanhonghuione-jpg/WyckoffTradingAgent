@@ -77,6 +77,19 @@ class GridCell:
     metrics_engine: str
 
 
+@dataclass(frozen=True)
+class RobustParamScore:
+    key: tuple[str, int, int, int, int]
+    cells: tuple[GridCell, ...]
+    best_cell: GridCell
+    score: float
+    period_count: int
+    positive_periods: int
+    avg_cash_return: float | None
+    min_cash_return: float | None
+    recent_cash_return: float | None
+
+
 def _to_float(raw: str | None) -> float | None:
     if raw is None:
         return None
@@ -364,6 +377,62 @@ def _cash_sort_key(cell: GridCell) -> float:
     return _cell_sort_key(cell)
 
 
+def _robust_param_key(cell: GridCell) -> tuple[str, int, int, int, int]:
+    return (cell.portfolio_style or "slot_equal_4", cell.hold, cell.stop_loss, cell.take_profit, cell.trailing_stop)
+
+
+def _cell_cash_return(cell: GridCell) -> float:
+    return cell.cash_total_return if cell.cash_total_return is not None else float("-inf")
+
+
+def _representative_cell(cells: list[GridCell]) -> GridCell:
+    recent = [c for c in cells if c.period_key == "recent_6m"]
+    pool = recent or cells
+    return max(pool, key=_cash_sort_key)
+
+
+def _robust_score(values: list[float], recent_ret: float | None, positive_periods: int) -> float:
+    if not values:
+        return float("-inf")
+    recent_component = (recent_ret or 0.0) * 0.2
+    return min(values) + mean(values) * 0.35 + recent_component + positive_periods * 4.0
+
+
+def _rank_robust_params(cells: list[GridCell]) -> list[RobustParamScore]:
+    groups: dict[tuple[str, int, int, int, int], list[GridCell]] = defaultdict(list)
+    for cell in cells:
+        groups[_robust_param_key(cell)].append(cell)
+    ranked = [_score_param_group(key, group) for key, group in groups.items()]
+    return sorted(ranked, key=lambda item: item.score, reverse=True)
+
+
+def _score_param_group(key: tuple[str, int, int, int, int], group: list[GridCell]) -> RobustParamScore:
+    by_period = _best_cells_by_period(group)
+    values = [_cell_cash_return(c) for c in by_period.values() if _cell_cash_return(c) != float("-inf")]
+    recent_ret = _cell_cash_return(by_period["recent_6m"]) if "recent_6m" in by_period else None
+    positives = sum(1 for value in values if value > 0)
+    return RobustParamScore(
+        key=key,
+        cells=tuple(group),
+        best_cell=_representative_cell(group),
+        score=_robust_score(values, recent_ret, positives),
+        period_count=len(by_period),
+        positive_periods=positives,
+        avg_cash_return=_safe_mean(values),
+        min_cash_return=min(values) if values else None,
+        recent_cash_return=recent_ret if recent_ret != float("-inf") else None,
+    )
+
+
+def _best_cells_by_period(group: list[GridCell]) -> dict[str, GridCell]:
+    by_period: dict[str, GridCell] = {}
+    for cell in group:
+        key = cell.period_key or _period_label(cell)
+        if key not in by_period or _cash_sort_key(cell) > _cash_sort_key(by_period[key]):
+            by_period[key] = cell
+    return by_period
+
+
 def _build_period_best_table(cells: list[GridCell]) -> list[str]:
     groups: dict[str, list[GridCell]] = defaultdict(list)
     for cell in cells:
@@ -431,6 +500,38 @@ def _build_style_best_table(cells: list[GridCell]) -> list[str]:
                     _fmt_num(best.sharpe, 3),
                     _fmt_num(best.max_drawdown, 1, "%"),
                     str(len(group)),
+                ]
+            )
+            + " |"
+        )
+    return lines
+
+
+def _build_robust_param_table(scores: list[RobustParamScore]) -> list[str]:
+    if len(scores) < 2:
+        return []
+    lines = [
+        "",
+        "## 跨周期参数稳健性",
+        "",
+        "| 排名 | 参数组合 | 正周期 | 最近收益 | 平均收益 | 最差收益 | 稳健分 | 覆盖周期 |",
+        "|---:|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for idx, score in enumerate(scores[:12], 1):
+        cell = score.best_cell
+        marker = " 🏆" if idx == 1 else ""
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(idx),
+                    f"{_fmt_param(cell)}{marker}",
+                    f"{score.positive_periods}/{score.period_count}",
+                    _fmt_signed(score.recent_cash_return, 2, "%"),
+                    _fmt_signed(score.avg_cash_return, 2, "%"),
+                    _fmt_signed(score.min_cash_return, 2, "%"),
+                    _fmt_num(score.score, 2),
+                    str(score.period_count),
                 ]
             )
             + " |"
@@ -555,26 +656,19 @@ def _best_per_hold_comment(cells: list[GridCell]) -> str:
     return "；".join(parts)
 
 
-def build_report(cells: list[GridCell], run_url: str = "", generated_at: str = "") -> str:
-    if not cells:
-        raise ValueError("未找到可解析的 backtest summary artifacts")
-
-    ranked = sorted(cells, key=_cash_sort_key, reverse=True)
-    best = ranked[0]
-    best_sharpe_cell = max(cells, key=_cell_sort_key)
-    best_rows = _read_trades(best.trades_path)
-    diagnostics = _build_trade_diagnostics(best_rows)
-    regime_stats = _group_stats(best_rows, lambda r: r.get("regime", ""))
-    trigger_stats = _group_stats(best_rows, lambda r: r.get("trigger", ""))
-    current_cycle, cycle_detail = _latest_cycle(best_rows)
-
-    generated = generated_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    pos_sharpe = sum(1 for c in cells if (c.sharpe or 0) > 0)
-    neg_sharpe = len(cells) - pos_sharpe
-    period_best_table = _build_period_best_table(cells)
-    style_best_table = _build_style_best_table(cells)
-
-    lines: list[str] = [
+def _build_execution_context_lines(
+    *,
+    cells: list[GridCell],
+    best: GridCell,
+    diagnostics: dict[str, object],
+    current_cycle: str,
+    cycle_detail: str,
+    generated: str,
+    pos_sharpe: int,
+    neg_sharpe: int,
+    run_url: str,
+) -> list[str]:
+    return [
         "# 当前市场回测报告",
         "",
         f"> 自动生成于 {generated}。本文件由 `scripts/update_backtest_market_report.py` 从 Backtest Grid artifacts 更新。",
@@ -590,16 +684,33 @@ def build_report(cells: list[GridCell], run_url: str = "", generated_at: str = "
         f"- 每日候选上限: {best.top_n or '-'}",
         f"- 参数/风格单元: {len(cells)} 组；正夏普 {pos_sharpe} 组，非正夏普 {neg_sharpe} 组",
         f"- GitHub Actions: {run_url or '-'}",
+    ]
+
+
+def _build_conclusion_lines(
+    *,
+    cells: list[GridCell],
+    best: GridCell,
+    robust_best: RobustParamScore | None,
+    diagnostics: dict[str, object],
+) -> list[str]:
+    lines = [
         "",
         "## 本次结论",
         "",
-        f"- 最优参数（按现金收益）: **{_fmt_param(best)}**",
-        f"- 最优夏普: **{_fmt_num(best.sharpe, 3)}**；胜率 **{_fmt_num(best.win_rate, 1, '%')}**；单笔均收 **{_fmt_signed(best.avg_ret, 2, '%')}**；最大回撤 **{_fmt_num(best.max_drawdown, 1, '%')}**；样本 **{best.trades or 0}** 笔",
-        f"- 现金账户: 初始 **{_fmt_num(best.cash_initial, 2)}**；最终 **{_fmt_num(best.cash_final, 2)}**；盈亏 **{_fmt_signed(_cash_pnl(best), 2)}**；收益 **{_fmt_signed(best.cash_total_return, 2, '%')}**；现金成交 **{best.cash_trades or 0}** 笔",
+        f"- 稳健参数（跨周期惩罚）: **{_fmt_param(best)}**",
+        f"- 代表单元: 夏普 **{_fmt_num(best.sharpe, 3)}**；胜率 **{_fmt_num(best.win_rate, 1, '%')}**；单笔均收 **{_fmt_signed(best.avg_ret, 2, '%')}**；最大回撤 **{_fmt_num(best.max_drawdown, 1, '%')}**；样本 **{best.trades or 0}** 笔",
+        f"- 代表现金账户: 初始 **{_fmt_num(best.cash_initial, 2)}**；最终 **{_fmt_num(best.cash_final, 2)}**；盈亏 **{_fmt_signed(_cash_pnl(best), 2)}**；收益 **{_fmt_signed(best.cash_total_return, 2, '%')}**；现金成交 **{best.cash_trades or 0}** 笔",
         f"- wbt 校验: 夏普 {_fmt_num(best.wbt_sharpe, 3)}，最大回撤 {_fmt_num(best.wbt_max_drawdown, 2, '%')}，日胜率 {_fmt_num(best.wbt_daily_win_rate, 2, '%')}；绩效引擎 `{best.metrics_engine or '-'}`",
         f"- 参数观察: {_best_per_hold_comment(cells)}",
     ]
-
+    if robust_best:
+        lines.append(
+            f"- 跨周期稳健性: 正收益周期 {robust_best.positive_periods}/{robust_best.period_count}；"
+            f"平均现金收益 {_fmt_signed(robust_best.avg_cash_return, 2, '%')}；"
+            f"最差周期 {_fmt_signed(robust_best.min_cash_return, 2, '%')}；"
+            f"稳健分 {_fmt_num(robust_best.score, 2)}。"
+        )
     if best.take_profit == 0:
         lines.append("- 退出观察: 当前最佳组合关闭固定止盈，说明右尾大赢家对收益贡献很大，固定 TP 容易截断趋势。")
     if best.win_rate is not None and best.win_rate < 35 and best.avg_ret is not None and best.avg_ret > 0:
@@ -611,19 +722,38 @@ def build_report(cells: list[GridCell], run_url: str = "", generated_at: str = "
             f"- 右尾依赖: 去掉最大盈利单后单笔均收约 {_fmt_signed(diagnostics['drop_top_1_avg'], 2, '%')}；"
             f"去掉前三大盈利单后约 {_fmt_signed(diagnostics['drop_top_3_avg'], 2, '%')}。"
         )
+    return lines
 
-    lines.extend(period_best_table)
-    lines.extend(style_best_table)
 
-    lines.extend(
-        [
-            "",
-            "## 参数梯队（按现金收益）",
-            "",
-            "| 排名 | 参数组合 | 夏普 | 胜率 | 均收 | 回撤 | 最终现金 | 现金收益 | 样本 |",
-            "|---:|---|---:|---:|---:|---:|---:|---:|---:|",
-        ]
+def _build_followup_lines(regime_stats: list[dict[str, object]], trigger_stats: list[dict[str, object]]) -> list[str]:
+    negative_regimes = [s for s in regime_stats if isinstance(s["avg"], float) and s["avg"] < 0]
+    positive_regimes = [s for s in regime_stats if isinstance(s["avg"], float) and s["avg"] > 0]
+    lines = ["", "## 解读与后续策略", ""]
+    if positive_regimes:
+        pos_text = "、".join(f"{s['key']}({_fmt_signed(s['avg'], 2, '%')})" for s in positive_regimes)
+        lines.append(f"- 优势周期: {pos_text}，这些水温下更适合保留趋势跟踪仓位。")
+    if negative_regimes:
+        neg_text = "、".join(f"{s['key']}({_fmt_signed(s['avg'], 2, '%')})" for s in negative_regimes)
+        lines.append(f"- 弱势周期: {neg_text}，这些水温下建议降仓、禁开或增加确认。")
+    pure_sos = next((s for s in trigger_stats if s["key"] == "sos"), None)
+    if pure_sos and isinstance(pure_sos["avg"], float) and pure_sos["avg"] < 0:
+        lines.append(
+            f"- 纯 SOS 信号本轮均收 {_fmt_signed(pure_sos['avg'], 2, '%')}，建议后续测试 `SOS+EVR/Spring/LPS` 或次日跟随确认，避免宽口径突破噪音。"
+        )
+    lines.append(
+        "- 后续每次 Backtest Grid 完成后，本文件会被 workflow 自动刷新；若 Actions token 有写权限，会提交到仓库，否则仍会作为 artifact 留存。"
     )
+    return lines
+
+
+def _build_ranked_table(ranked: list[GridCell], best: GridCell) -> list[str]:
+    lines = [
+        "",
+        "## 参数梯队（按现金收益）",
+        "",
+        "| 排名 | 参数组合 | 夏普 | 胜率 | 均收 | 回撤 | 最终现金 | 现金收益 | 样本 |",
+        "|---:|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
     for idx, cell in enumerate(ranked, 1):
         marker = " 🏆" if cell == best else ""
         lines.append(
@@ -643,27 +773,31 @@ def build_report(cells: list[GridCell], run_url: str = "", generated_at: str = "
             )
             + " |"
         )
+    return lines
 
-    lines.extend(["", "## 最优夏普矩阵", "", *_build_matrix(cells, best_sharpe_cell)])
 
-    lines.extend(
-        [
-            "",
-            "## 最优组合交易结构",
-            "",
-            f"- 交易笔数: {diagnostics['count']}；盈利 {diagnostics['wins']}；亏损 {diagnostics['losses']}",
-            f"- 单笔胜率: {_fmt_num(diagnostics['win_rate'], 2, '%')}",
-            f"- 盈利单均值: {_fmt_signed(diagnostics['avg_win'], 2, '%')}",
-            f"- 亏损单均值: {_fmt_signed(diagnostics['avg_loss'], 2, '%')}",
-            f"- 盈亏比: {_fmt_num(diagnostics['payoff'], 2)}",
-            f"- 单笔中位数: {_fmt_signed(diagnostics['median_all'], 2, '%')}",
-            "",
-            "## 市场周期分层",
-            "",
-            "| 周期 | 含义 | 笔数 | 信号期 | 胜率 | 均收 | 中位数 |",
-            "|---|---|---:|---|---:|---:|---:|",
-        ]
-    )
+def _build_trade_structure_lines(diagnostics: dict[str, object]) -> list[str]:
+    return [
+        "",
+        "## 最优组合交易结构",
+        "",
+        f"- 交易笔数: {diagnostics['count']}；盈利 {diagnostics['wins']}；亏损 {diagnostics['losses']}",
+        f"- 单笔胜率: {_fmt_num(diagnostics['win_rate'], 2, '%')}",
+        f"- 盈利单均值: {_fmt_signed(diagnostics['avg_win'], 2, '%')}",
+        f"- 亏损单均值: {_fmt_signed(diagnostics['avg_loss'], 2, '%')}",
+        f"- 盈亏比: {_fmt_num(diagnostics['payoff'], 2)}",
+        f"- 单笔中位数: {_fmt_signed(diagnostics['median_all'], 2, '%')}",
+    ]
+
+
+def _build_regime_stats_table(regime_stats: list[dict[str, object]]) -> list[str]:
+    lines = [
+        "",
+        "## 市场周期分层",
+        "",
+        "| 周期 | 含义 | 笔数 | 信号期 | 胜率 | 均收 | 中位数 |",
+        "|---|---|---:|---|---:|---:|---:|",
+    ]
     for stat in regime_stats:
         key = str(stat["key"])
         date_range = f"{stat['first_date']} ~ {stat['last_date']}" if stat["first_date"] else "-"
@@ -682,16 +816,11 @@ def build_report(cells: list[GridCell], run_url: str = "", generated_at: str = "
             )
             + " |"
         )
+    return lines
 
-    lines.extend(
-        [
-            "",
-            "## 信号类型分层",
-            "",
-            "| 信号 | 笔数 | 胜率 | 均收 | 中位数 |",
-            "|---|---:|---:|---:|---:|",
-        ]
-    )
+
+def _build_trigger_stats_table(trigger_stats: list[dict[str, object]]) -> list[str]:
+    lines = ["", "## 信号类型分层", "", "| 信号 | 笔数 | 胜率 | 均收 | 中位数 |", "|---|---:|---:|---:|---:|"]
     for stat in trigger_stats:
         lines.append(
             "| "
@@ -706,37 +835,68 @@ def build_report(cells: list[GridCell], run_url: str = "", generated_at: str = "
             )
             + " |"
         )
+    return lines
 
-    negative_regimes = [s for s in regime_stats if isinstance(s["avg"], float) and s["avg"] < 0]
-    positive_regimes = [s for s in regime_stats if isinstance(s["avg"], float) and s["avg"] > 0]
-    lines.extend(["", "## 解读与后续策略", ""])
-    if positive_regimes:
-        pos_text = "、".join(f"{s['key']}({_fmt_signed(s['avg'], 2, '%')})" for s in positive_regimes)
-        lines.append(f"- 优势周期: {pos_text}，这些水温下更适合保留趋势跟踪仓位。")
-    if negative_regimes:
-        neg_text = "、".join(f"{s['key']}({_fmt_signed(s['avg'], 2, '%')})" for s in negative_regimes)
-        lines.append(f"- 弱势周期: {neg_text}，这些水温下建议降仓、禁开或增加确认。")
-    pure_sos = next((s for s in trigger_stats if s["key"] == "sos"), None)
-    if pure_sos and isinstance(pure_sos["avg"], float) and pure_sos["avg"] < 0:
-        lines.append(
-            f"- 纯 SOS 信号本轮均收 {_fmt_signed(pure_sos['avg'], 2, '%')}，建议后续测试 `SOS+EVR/Spring/LPS` 或次日跟随确认，避免宽口径突破噪音。"
-        )
-    lines.append(
-        "- 后续每次 Backtest Grid 完成后，本文件会被 workflow 自动刷新；若 Actions token 有写权限，会提交到仓库，否则仍会作为 artifact 留存。"
-    )
 
-    lines.extend(
-        [
-            "",
-            "## 口径说明",
-            "",
-            "- 胜率是单笔交易 `ret_pct > 0` 的比例，不是组合每日正收益比例。",
-            "- 入场口径以各参数单元 summary 为准；当前 workflow 默认 T+1 开盘价，`tail_1455` 模式缺分钟线时按 `BACKTEST_ENTRY_PRICE_FALLBACK` 处理。",
-            "- `可完整验证信号期` 会早于回测结束日，因为持有窗口需要足够后续交易日完成离场验证。",
-            "- 本结果仍可能包含当前股票池幸存者偏差，以及当前截面市值/行业映射带来的前视偏差；用于参数方向和市场周期适配判断，不等同于实盘承诺。",
-            "",
-        ]
+def _build_methodology_notes() -> list[str]:
+    return [
+        "",
+        "## 口径说明",
+        "",
+        "- 胜率是单笔交易 `ret_pct > 0` 的比例，不是组合每日正收益比例。",
+        "- 入场口径以各参数单元 summary 为准；当前 workflow 默认 T+1 开盘价，`tail_1455` 模式缺分钟线时按 `BACKTEST_ENTRY_PRICE_FALLBACK` 处理。",
+        "- `可完整验证信号期` 会早于回测结束日，因为持有窗口需要足够后续交易日完成离场验证。",
+        "- 本结果仍可能包含当前股票池幸存者偏差，以及当前截面市值/行业映射带来的前视偏差；用于参数方向和市场周期适配判断，不等同于实盘承诺。",
+        "",
+    ]
+
+
+def build_report(cells: list[GridCell], run_url: str = "", generated_at: str = "") -> str:
+    if not cells:
+        raise ValueError("未找到可解析的 backtest summary artifacts")
+
+    ranked = sorted(cells, key=_cash_sort_key, reverse=True)
+    robust_ranked = _rank_robust_params(cells)
+    robust_best = robust_ranked[0] if robust_ranked else None
+    best = robust_best.best_cell if robust_best else ranked[0]
+    best_sharpe_cell = max(cells, key=_cell_sort_key)
+    best_rows = _read_trades(best.trades_path)
+    diagnostics = _build_trade_diagnostics(best_rows)
+    regime_stats = _group_stats(best_rows, lambda r: r.get("regime", ""))
+    trigger_stats = _group_stats(best_rows, lambda r: r.get("trigger", ""))
+    current_cycle, cycle_detail = _latest_cycle(best_rows)
+
+    generated = generated_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    pos_sharpe = sum(1 for c in cells if (c.sharpe or 0) > 0)
+    neg_sharpe = len(cells) - pos_sharpe
+    period_best_table = _build_period_best_table(cells)
+    style_best_table = _build_style_best_table(cells)
+    robust_param_table = _build_robust_param_table(robust_ranked)
+
+    lines = _build_execution_context_lines(
+        cells=cells,
+        best=best,
+        diagnostics=diagnostics,
+        current_cycle=current_cycle,
+        cycle_detail=cycle_detail,
+        generated=generated,
+        pos_sharpe=pos_sharpe,
+        neg_sharpe=neg_sharpe,
+        run_url=run_url,
     )
+    lines.extend(_build_conclusion_lines(cells=cells, best=best, robust_best=robust_best, diagnostics=diagnostics))
+
+    lines.extend(period_best_table)
+    lines.extend(style_best_table)
+    lines.extend(robust_param_table)
+    lines.extend(_build_ranked_table(ranked, best))
+
+    lines.extend(["", "## 最优夏普矩阵", "", *_build_matrix(cells, best_sharpe_cell)])
+    lines.extend(_build_trade_structure_lines(diagnostics))
+    lines.extend(_build_regime_stats_table(regime_stats))
+    lines.extend(_build_trigger_stats_table(trigger_stats))
+    lines.extend(_build_followup_lines(regime_stats, trigger_stats))
+    lines.extend(_build_methodology_notes())
     return "\n".join(lines)
 
 

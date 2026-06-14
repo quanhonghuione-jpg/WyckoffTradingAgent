@@ -29,6 +29,16 @@ import pandas as pd
 # Ensure project root is on sys.path for direct script invocation
 if __name__ == "__main__" or not __package__:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core.candidate_policy import (
+    apply_loss_guard as _apply_loss_guard,
+)
+from core.candidate_policy import (
+    apply_regime_position_filter as _apply_regime_position_filter,
+)
+from core.candidate_policy import (
+    is_tradeable_l4_trigger_combo,
+    trigger_sets_by_code,
+)
 from core.cash_portfolio import (
     STYLE_LABELS,
     CashPortfolioConfig,
@@ -89,24 +99,6 @@ DEFAULT_ENTRY_PRICE_TIME = "14:55"
 DEFAULT_ENTRY_PRICE_FALLBACK = os.getenv("BACKTEST_ENTRY_PRICE_FALLBACK", "close").strip().lower() or "close"
 CN_ZONE = ZoneInfo("Asia/Shanghai")
 
-# ── 大盘水温仓位控制：根据 regime 调节每日候选上限，减少逆势开仓。 ──
-def _position_ratio_env(name: str, default: float) -> float:
-    try:
-        value = float(os.getenv(name, str(default)))
-    except Exception:
-        return default
-    return min(max(value, 0.0), 1.0)
-
-
-REGIME_POSITION_RATIO: dict[str, float] = {
-    "NEUTRAL": _position_ratio_env("BACKTEST_REGIME_NEUTRAL_POSITION_RATIO", 0.5),  # 震荡市 → 半仓
-    "RISK_ON": _position_ratio_env("BACKTEST_REGIME_RISK_ON_POSITION_RATIO", 0.25),  # 风险偏好期 → 只留最强确认
-    "BEAR_REBOUND": _position_ratio_env("BACKTEST_REGIME_BEAR_REBOUND_POSITION_RATIO", 0.25),  # 熊市反抽
-    "PANIC_REPAIR": _position_ratio_env("BACKTEST_REGIME_PANIC_REPAIR_POSITION_RATIO", 0.0),  # 恐慌修复
-    "RISK_OFF": _position_ratio_env("BACKTEST_REGIME_RISK_OFF_POSITION_RATIO", 0.0),  # 避险
-    "CRASH": _position_ratio_env("BACKTEST_REGIME_CRASH_POSITION_RATIO", 0.0),  # 崩盘
-    "BLACK_SWAN": _position_ratio_env("BACKTEST_REGIME_BLACK_SWAN_POSITION_RATIO", 0.0),
-}
 FUNNEL_AI_SELECTION_MODE = os.getenv("FUNNEL_AI_SELECTION_MODE", "tradeable_l4").strip().lower()
 try:
     BACKTEST_FULL_FORMAL_L4_MAX = max(int(float(os.getenv("FUNNEL_FULL_FORMAL_L4_MAX", "25"))), 0)
@@ -131,18 +123,6 @@ _LEGACY_SELECTION_MODES = {
     "all_hits",
     "classic",
 }
-_STRUCTURAL_L4_TRIGGERS = {"spring", "lps", "compression", "compress", "trend_pullback"}
-_NAKED_RIGHT_SIDE_TRIGGERS = {"sos", "evr"}
-BACKTEST_LOSS_GUARD_ENABLED = os.getenv("FUNNEL_LOSS_GUARD_ENABLED", "1").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-BACKTEST_LOSS_GUARD_LOW_SCORE = float(os.getenv("FUNNEL_LOSS_GUARD_LOW_SCORE", "1.0"))
-BACKTEST_LOSS_GUARD_RISK_ON_PRE5_RET = float(os.getenv("FUNNEL_LOSS_GUARD_RISK_ON_PRE5_RET", "25.0"))
-BACKTEST_LOSS_GUARD_RISK_ON_RANGE_POS = float(os.getenv("FUNNEL_LOSS_GUARD_RISK_ON_RANGE_POS", "85.0"))
-BACKTEST_LOSS_GUARD_RISK_ON_VOL_RATIO = float(os.getenv("FUNNEL_LOSS_GUARD_RISK_ON_VOL_RATIO", "1.8"))
 
 
 @dataclass
@@ -451,121 +431,57 @@ def _track_map_for_hits(
     return track_map
 
 
-def _trigger_sets_by_code(triggers: dict[str, list[tuple[str, float]]]) -> dict[str, set[str]]:
-    out: dict[str, set[str]] = {}
-    for trigger, pairs in triggers.items():
-        key = str(trigger).strip().lower()
-        if not key:
-            continue
-        for code, _ in pairs:
-            c = str(code).strip()
-            if c:
-                out.setdefault(c, set()).add(key)
-    return out
-
-
-def _is_tradeable_l4_trigger_combo(trigger_keys: set[str]) -> bool:
-    if not trigger_keys:
-        return False
-    if trigger_keys & _STRUCTURAL_L4_TRIGGERS:
-        return True
-    return not trigger_keys <= _NAKED_RIGHT_SIDE_TRIGGERS
-
-
-def _channel_tags(raw: str) -> set[str]:
-    return {x.strip() for x in str(raw or "").split("+") if x.strip()}
-
-
-def _is_pure_momentum_channel(channel: str) -> bool:
-    tags = _channel_tags(channel)
-    if not tags or "点火破局" in tags:
-        return False
-    return bool(tags <= {"主升通道", "趋势延续", "加速突破"})
-
-
-def _recent_overheat(df: pd.DataFrame | None) -> bool:
-    if df is None or df.empty or len(df) < 21:
-        return False
-    work = df.copy()
-    for col in ("close", "high", "low", "volume"):
-        if col not in work.columns:
-            return False
-        work[col] = pd.to_numeric(work[col], errors="coerce")
-    last = work.iloc[-1]
-    close = float(last.get("close") or 0.0)
-    if close <= 0:
-        return False
-    pre = work.tail(21).dropna(subset=["close", "high", "low", "volume"])
-    if len(pre) < 21:
-        return False
-    high20 = float(pre["high"].max())
-    low20 = float(pre["low"].min())
-    pre5_ret = (close / float(pre.iloc[-6]["close"]) - 1.0) * 100.0
-    range_pos = (close - low20) / (high20 - low20) * 100.0 if high20 > low20 else 0.0
-    vol20 = float(pre["volume"].tail(20).mean())
-    vol_ratio = float(pre["volume"].tail(5).mean()) / vol20 if vol20 > 0 else 0.0
-    return (
-        pre5_ret >= BACKTEST_LOSS_GUARD_RISK_ON_PRE5_RET
-        and range_pos >= BACKTEST_LOSS_GUARD_RISK_ON_RANGE_POS
-        and vol_ratio >= BACKTEST_LOSS_GUARD_RISK_ON_VOL_RATIO
-    )
-
-
-def _loss_guard_reason(
-    code: str,
-    regime: str,
-    trigger_keys: set[str],
-    trigger_score: float,
-    channel: str,
-    day_df_map: dict[str, pd.DataFrame],
-) -> str:
-    if not BACKTEST_LOSS_GUARD_ENABLED:
-        return ""
-    regime_norm = str(regime or "NEUTRAL").strip().upper() or "NEUTRAL"
-    if (
-        "lps" in trigger_keys
-        and not (trigger_keys & {"sos", "evr", "spring"})
-        and trigger_score < BACKTEST_LOSS_GUARD_LOW_SCORE
-    ):
-        return "低分LPS"
-    if regime_norm in {"RISK_OFF", "RISK_ON", "BEAR_REBOUND", "PANIC_REPAIR", "CRASH", "BLACK_SWAN"}:
-        if "lps" in trigger_keys and not (trigger_keys & {"sos", "evr", "spring"}):
-            return f"{regime_norm}禁用LPS"
-        if "trend_pullback" in trigger_keys and trigger_score < BACKTEST_LOSS_GUARD_LOW_SCORE:
-            return f"{regime_norm}低分回踩"
-    if regime_norm in {"RISK_ON", "BEAR_REBOUND"} and (trigger_keys & {"sos", "evr", "trend_pullback"}):
-        if _is_pure_momentum_channel(channel):
-            return f"{regime_norm}纯趋势追涨"
-        if _recent_overheat(day_df_map.get(code)):
-            return f"{regime_norm}短期过热"
-    return ""
-
-
-def _apply_tradeable_loss_guard(
-    selected_codes: list[str],
-    trend_sel: list[str],
-    accum_sel: list[str],
+def _quota_ai_inputs(
     *,
-    regime: str,
-    trigger_sets: dict[str, set[str]],
-    trigger_score_map: dict[str, float],
-    channel_map: dict[str, str],
+    result: FunnelResult,
     day_df_map: dict[str, pd.DataFrame],
-) -> tuple[list[str], list[str], list[str]]:
-    kept: list[str] = []
-    for code in selected_codes:
-        reason = _loss_guard_reason(
-            code,
-            regime,
-            trigger_sets.get(code, set()),
-            float(trigger_score_map.get(code, 0.0) or 0.0),
-            str(channel_map.get(code, "") or ""),
-            day_df_map,
-        )
-        if not reason:
-            kept.append(code)
-    kept_set = set(kept)
-    return kept, [c for c in trend_sel if c in kept_set], [c for c in accum_sel if c in kept_set]
+    sector_map: dict[str, str],
+    regime: str,
+) -> tuple[list[str], list[str], list[str], dict[str, float]]:
+    sector_rotation = analyze_sector_rotation(
+        day_df_map,
+        sector_map,
+        universe_symbols=list(day_df_map.keys()),
+        focus_sectors=result.top_sectors,
+    )
+    l3_ranked_symbols, _ = rank_l3_candidates(
+        l3_symbols=result.layer3_symbols,
+        df_map=day_df_map,
+        sector_map=sector_map,
+        triggers=result.triggers,
+        top_sectors=result.top_sectors,
+        l2_channel_map=result.channel_map,
+        sector_rotation_map=(sector_rotation or {}).get("state_map", {}) or {},
+    )
+    trend_sel, accum_sel, score_map = allocate_ai_candidates(
+        result,
+        l3_ranked_symbols or result.layer3_symbols,
+        regime,
+        sector_map=sector_map,
+        max_per_sector=2,
+    )
+    return _dedup_order(trend_sel + accum_sel), trend_sel, accum_sel, score_map
+
+
+def _select_l4_mode_codes(
+    *,
+    result: FunnelResult,
+    sorted_hit_codes: list[str],
+    hit_score_map: dict[str, float],
+    selection_mode: str,
+) -> tuple[list[str], dict[str, float], dict[str, str]] | None:
+    if selection_mode in _STRICT_L4_SELECTION_MODES:
+        trigger_sets = trigger_sets_by_code(result.triggers)
+        selected_codes = [
+            code for code in sorted_hit_codes if is_tradeable_l4_trigger_combo(trigger_sets.get(code, set()))
+        ]
+    elif selection_mode in _FORMAL_L4_SELECTION_MODES or selection_mode in _LEGACY_SELECTION_MODES:
+        cap = int(BACKTEST_FULL_FORMAL_L4_MAX)
+        selected_codes = sorted_hit_codes if cap <= 0 else sorted_hit_codes[:cap]
+    else:
+        return None
+    score_map = {code: hit_score_map.get(code, 0.0) for code in selected_codes}
+    return selected_codes, score_map, _track_map_for_hits(selected_codes, result.triggers)
 
 
 def _select_ai_input_codes(
@@ -576,13 +492,7 @@ def _select_ai_input_codes(
     regime: str,
     selection_mode: str,
 ) -> tuple[list[str], dict[str, float], dict[str, str]]:
-    """
-    按线上漏斗口径选出“送给 AI 的候选池”：
-    - tradeable_l4：只回放结构型 L4，剔除裸 SOS/EVR 追高噪声
-    - all_formal_l4 / legacy_full_hits：全量 L4 命中，按触发分值排序
-    - modern quotas：L3 排序 + allocate_ai_candidates 动态配额
-    返回 (selected_codes, priority_score_map, track_map)
-    """
+    """按线上漏斗口径选出送给 AI 的候选池。"""
     merged_trigger_map = _combine_trigger_scores(result.triggers)
     hit_score_map = {code: float(v[0]) for code, v in merged_trigger_map.items()}
     sorted_hit_codes = sorted(
@@ -590,55 +500,31 @@ def _select_ai_input_codes(
         key=lambda c: -hit_score_map.get(c, 0.0),
     )
 
-    if selection_mode in _STRICT_L4_SELECTION_MODES:
-        trigger_sets = _trigger_sets_by_code(result.triggers)
-        selected_codes = [
-            code for code in sorted_hit_codes if _is_tradeable_l4_trigger_combo(trigger_sets.get(code, set()))
-        ]
-        score_map = {code: hit_score_map.get(code, 0.0) for code in selected_codes}
-        return selected_codes, score_map, _track_map_for_hits(selected_codes, result.triggers)
+    l4_selection = _select_l4_mode_codes(
+        result=result,
+        sorted_hit_codes=sorted_hit_codes,
+        hit_score_map=hit_score_map,
+        selection_mode=selection_mode,
+    )
+    if l4_selection is not None:
+        return l4_selection
 
-    if selection_mode in _FORMAL_L4_SELECTION_MODES or selection_mode in _LEGACY_SELECTION_MODES:
-        cap = int(BACKTEST_FULL_FORMAL_L4_MAX)
-        selected_codes = sorted_hit_codes if cap <= 0 else sorted_hit_codes[:cap]
-        score_map = {code: hit_score_map.get(code, 0.0) for code in selected_codes}
-        return selected_codes, score_map, _track_map_for_hits(selected_codes, result.triggers)
-
-    sector_rotation = analyze_sector_rotation(
-        day_df_map,
-        sector_map,
-        universe_symbols=list(day_df_map.keys()),
-        focus_sectors=result.top_sectors,
-    )
-    sector_rotation_map = (sector_rotation or {}).get("state_map", {}) or {}
-    l3_ranked_symbols, _ = rank_l3_candidates(
-        l3_symbols=result.layer3_symbols,
-        df_map=day_df_map,
+    selected_codes, trend_sel, accum_sel, priority_score_map = _quota_ai_inputs(
+        result=result,
+        day_df_map=day_df_map,
         sector_map=sector_map,
-        triggers=result.triggers,
-        top_sectors=result.top_sectors,
-        l2_channel_map=result.channel_map,
-        sector_rotation_map=sector_rotation_map,
+        regime=regime,
     )
-    trend_sel, accum_sel, priority_score_map = allocate_ai_candidates(
-        result,
-        l3_ranked_symbols or result.layer3_symbols,
-        regime,
-        sector_map=sector_map,
-        max_per_sector=2,
-    )
-    selected_codes = _dedup_order(trend_sel + accum_sel)
     if selection_mode in _TRADEABLE_L4_SELECTION_MODES:
-        trigger_sets = _trigger_sets_by_code(result.triggers)
-        selected_codes, trend_sel, accum_sel = _apply_tradeable_loss_guard(
+        selected_codes, trend_sel, accum_sel, _ = _apply_loss_guard(
             selected_codes,
             trend_sel,
             accum_sel,
             regime=regime,
-            trigger_sets=trigger_sets,
-            trigger_score_map=hit_score_map,
+            code_to_trigger_keys=trigger_sets_by_code(result.triggers),
+            code_to_total_score=hit_score_map,
             channel_map=result.channel_map,
-            day_df_map=day_df_map,
+            df_map=day_df_map,
         )
     min_score = float(getattr(FunnelConfig, "min_funnel_score", 0.15) or 0)
     if min_score > 0 and priority_score_map:
@@ -646,19 +532,6 @@ def _select_ai_input_codes(
     track_map = dict.fromkeys(trend_sel, "Trend")
     track_map.update(dict.fromkeys(accum_sel, "Accum"))
     return selected_codes, priority_score_map, track_map
-
-
-def _apply_regime_position_filter(ranked_codes: list[str], regime: str) -> list[str]:
-    if not ranked_codes:
-        return []
-    regime_norm = str(regime or "NEUTRAL").strip().upper() or "NEUTRAL"
-    ratio = REGIME_POSITION_RATIO.get(regime_norm, REGIME_POSITION_RATIO["NEUTRAL"])
-    if ratio <= 0:
-        return []
-    if ratio >= 1.0:
-        return ranked_codes
-    keep_n = max(1, int(len(ranked_codes) * ratio + 0.5))
-    return ranked_codes[:keep_n]
 
 
 def _entry_price_source_counts(trades_df: pd.DataFrame) -> dict[str, int]:

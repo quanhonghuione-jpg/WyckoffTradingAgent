@@ -51,7 +51,7 @@ def test_market_report_includes_cash_account_metrics(tmp_path):
 
     report = build_report(cells)
 
-    assert "现金账户: 初始 **100000.00**；最终 **53785.51**；盈亏 **-46214.49**" in report
+    assert "代表现金账户: 初始 **100000.00**；最终 **53785.51**；盈亏 **-46214.49**" in report
     assert "| 排名 | 参数组合 | 夏普 | 胜率 | 均收 | 回撤 | 最终现金 | 现金收益 | 样本 |" in report
 
 
@@ -102,6 +102,54 @@ def test_market_report_groups_multi_period_grid(tmp_path):
     assert "最近6个月: 2025-12-01 ~ 2026-05-31 (1组)" in report
     assert "牛市 2020-07~2021-02" in report
     assert "熊市 2021-12~2022-10" in report
+
+
+def test_market_report_prefers_cross_period_robust_params(tmp_path):
+    from scripts.update_backtest_market_report import build_report, load_grid_cells
+
+    rows = [
+        ("recent_6m", "h10", "sl6", 30.0),
+        ("bull_2020", "h10", "sl6", -25.0),
+        ("bear_2022", "h10", "sl6", -20.0),
+        ("recent_6m", "h15", "sl8", 6.0),
+        ("bull_2020", "h15", "sl8", 4.0),
+        ("bear_2022", "h15", "sl8", 3.0),
+    ]
+    ranges = {
+        "recent_6m": ("2025-12-01", "2026-05-31"),
+        "bull_2020": ("2020-07-01", "2021-02-18"),
+        "bear_2022": ("2021-12-13", "2022-10-31"),
+    }
+    for period, hold, stop, cash_return in rows:
+        start, end = ranges[period]
+        artifact = tmp_path / f"backtest-grid-{period}-{hold}-{stop}-tp0-tr0-37"
+        artifact.mkdir()
+        (artifact / f"summary_{period}_{hold}.md").write_text(
+            "\n".join(
+                [
+                    f"- 区间: {start} ~ {end}",
+                    "- 每日候选上限: Top 4",
+                    "- 股票池: main_chinext (sample=0)",
+                    "- 绩效引擎: legacy",
+                    "- 成交样本: 10",
+                    "- 胜率: 40.0%",
+                    "- 平均收益: 1.0%",
+                    "- 中位收益: 0.5%",
+                    "- 夏普比 (Sharpe Ratio): 0.3",
+                    "- 最大回撤: -10.0%",
+                    "- 初始现金: 100000.00",
+                    f"- 最终现金: {100000 * (1 + cash_return / 100):.2f}",
+                    f"- 总收益: {cash_return}%",
+                    "- 成交笔数: 4",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    report = build_report(load_grid_cells(tmp_path))
+
+    assert "稳健参数（跨周期惩罚）: **等额四仓 / 15天 / SL-8% / 无TP / 无Trail**" in report
+    assert "跨周期参数稳健性" in report
 
 
 def test_market_report_expands_cash_portfolio_styles(tmp_path):

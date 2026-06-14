@@ -24,6 +24,12 @@ import pandas as pd
 # Ensure project root is on sys.path for direct script invocation
 if __name__ == "__main__" or not __package__:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core.candidate_policy import (
+    apply_loss_guard as _apply_loss_guard,
+)
+from core.candidate_policy import (
+    rerank_selected_codes as _rerank_selected_codes,
+)
 from core.dynamic_policy import (
     build_signal_weight_map,
     dynamic_policy_horizon,
@@ -225,16 +231,6 @@ try:
 except Exception:
     logger.debug("FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_MIN_SCORE parse failed, using default", exc_info=True)
     FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_MIN_SCORE = 55.0
-FUNNEL_LOSS_GUARD_ENABLED = os.getenv("FUNNEL_LOSS_GUARD_ENABLED", "1").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-FUNNEL_LOSS_GUARD_LOW_SCORE = float(os.getenv("FUNNEL_LOSS_GUARD_LOW_SCORE", "1.0"))
-FUNNEL_LOSS_GUARD_RISK_ON_PRE5_RET = float(os.getenv("FUNNEL_LOSS_GUARD_RISK_ON_PRE5_RET", "25.0"))
-FUNNEL_LOSS_GUARD_RISK_ON_RANGE_POS = float(os.getenv("FUNNEL_LOSS_GUARD_RISK_ON_RANGE_POS", "85.0"))
-FUNNEL_LOSS_GUARD_RISK_ON_VOL_RATIO = float(os.getenv("FUNNEL_LOSS_GUARD_RISK_ON_VOL_RATIO", "1.8"))
 
 
 def _resolve_funnel_end_calendar_day() -> date:
@@ -731,102 +727,6 @@ def _rank_l2_bypass_pool(l2_bypass_pool: list[str], code_to_total_score: dict[st
     return sorted(clean_pool, key=lambda c: (-code_to_total_score.get(c, 0.0), c))
 
 
-def _channel_tags(raw: str) -> set[str]:
-    return {x.strip() for x in str(raw or "").split("+") if x.strip()}
-
-
-def _is_pure_momentum_channel(channel: str) -> bool:
-    tags = _channel_tags(channel)
-    if not tags or "点火破局" in tags:
-        return False
-    return bool(tags <= {"主升通道", "趋势延续", "加速突破"})
-
-
-def _recent_overheat(df: pd.DataFrame | None) -> bool:
-    if df is None or df.empty or len(df) < 21:
-        return False
-    work = df.copy()
-    for col in ("close", "high", "low", "volume"):
-        if col not in work.columns:
-            return False
-        work[col] = pd.to_numeric(work[col], errors="coerce")
-    last = work.iloc[-1]
-    close = float(last.get("close") or 0.0)
-    if close <= 0:
-        return False
-    pre = work.tail(21).dropna(subset=["close", "high", "low", "volume"])
-    if len(pre) < 21:
-        return False
-    high20 = float(pre["high"].max())
-    low20 = float(pre["low"].min())
-    pre5_ret = (close / float(pre.iloc[-6]["close"]) - 1.0) * 100.0
-    range_pos = (close - low20) / (high20 - low20) * 100.0 if high20 > low20 else 0.0
-    vol20 = float(pre["volume"].tail(20).mean())
-    vol_ratio = float(pre["volume"].tail(5).mean()) / vol20 if vol20 > 0 else 0.0
-    return (
-        pre5_ret >= FUNNEL_LOSS_GUARD_RISK_ON_PRE5_RET
-        and range_pos >= FUNNEL_LOSS_GUARD_RISK_ON_RANGE_POS
-        and vol_ratio >= FUNNEL_LOSS_GUARD_RISK_ON_VOL_RATIO
-    )
-
-
-def _loss_guard_reason(
-    code: str,
-    regime: str,
-    trigger_keys: list[str],
-    trigger_score: float,
-    channel: str,
-    df_map: dict[str, pd.DataFrame],
-) -> str:
-    if not FUNNEL_LOSS_GUARD_ENABLED:
-        return ""
-    keys = {str(k).strip().lower() for k in trigger_keys if str(k).strip()}
-    regime_norm = str(regime or "NEUTRAL").strip().upper() or "NEUTRAL"
-    if "lps" in keys and not (keys & {"sos", "evr", "spring"}) and trigger_score < FUNNEL_LOSS_GUARD_LOW_SCORE:
-        return "低分LPS"
-    if regime_norm in {"RISK_OFF", "RISK_ON", "BEAR_REBOUND", "PANIC_REPAIR", "CRASH", "BLACK_SWAN"}:
-        if "lps" in keys and not (keys & {"sos", "evr", "spring"}):
-            return f"{regime_norm}禁用LPS"
-        if "trend_pullback" in keys and trigger_score < FUNNEL_LOSS_GUARD_LOW_SCORE:
-            return f"{regime_norm}低分回踩"
-    if regime_norm in {"RISK_ON", "BEAR_REBOUND"} and (keys & {"sos", "evr", "trend_pullback"}):
-        if _is_pure_momentum_channel(channel):
-            return f"{regime_norm}纯趋势追涨"
-        if _recent_overheat(df_map.get(code)):
-            return f"{regime_norm}短期过热"
-    return ""
-
-
-def _apply_loss_guard(
-    selected_for_ai: list[str],
-    trend_selected: list[str],
-    accum_selected: list[str],
-    *,
-    regime: str,
-    code_to_trigger_keys: dict[str, list[str]],
-    code_to_total_score: dict[str, float],
-    channel_map: dict[str, str],
-    df_map: dict[str, pd.DataFrame],
-) -> tuple[list[str], list[str], list[str], dict[str, int]]:
-    kept: list[str] = []
-    dropped: dict[str, int] = {}
-    for code in selected_for_ai:
-        reason = _loss_guard_reason(
-            code,
-            regime,
-            code_to_trigger_keys.get(code, []),
-            float(code_to_total_score.get(code, 0.0) or 0.0),
-            str(channel_map.get(code, "") or ""),
-            df_map,
-        )
-        if reason:
-            dropped[reason] = dropped.get(reason, 0) + 1
-        else:
-            kept.append(code)
-    kept_set = set(kept)
-    return kept, [c for c in trend_selected if c in kept_set], [c for c in accum_selected if c in kept_set], dropped
-
-
 def _should_force_quota_selection(regime: str, full_mode_enabled: bool) -> bool:
     if not full_mode_enabled or not FUNNEL_DEFENSIVE_FORCE_QUOTA:
         return False
@@ -1260,16 +1160,6 @@ def _promote_theme_l4_for_ai(
             trend_selected.append(code)
         track_seen.add(code)
     return added
-
-
-def _rerank_selected_codes(codes: list[str], score_map: dict[str, float]) -> list[str]:
-    seen: set[str] = set()
-    deduped = []
-    for code in codes:
-        if code not in seen:
-            deduped.append(code)
-            seen.add(code)
-    return sorted(deduped, key=lambda c: (-float(score_map.get(c, 0.0) or 0.0), c))
 
 
 def _theme_report_fields(code: str, candidate_map: dict[str, dict], bonus_map: dict[str, float]) -> dict:

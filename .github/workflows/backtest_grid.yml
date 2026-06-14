@@ -219,7 +219,7 @@ jobs:
       matrix:
         period_key: [recent_6m, bull_2020, bear_2022]
         hold_days: [10, 15]
-        stop_loss: [-8, -10]
+        stop_loss: [-7, -8]
         trailing_stop: [0]
     env:
       PYTHONUNBUFFERED: "1"
@@ -662,6 +662,33 @@ jobs:
           def rank_value(c):
               return c.get('cash_return') if c.get('cash_return') is not None else c.get('sharpe')
 
+          def robust_key(c):
+              return (c.get('style', ''), c.get('hold'), c.get('sl'), c.get('tp'), c.get('tr'))
+
+          def robust_representative(group):
+              recent = [c for c in group if c.get('period') == 'recent_6m']
+              return max(recent or group, key=rank_value)
+
+          def robust_scores(cells_for_rank):
+              groups = {}
+              for c in cells_for_rank:
+                  groups.setdefault(robust_key(c), []).append(c)
+              out = []
+              for group in groups.values():
+                  by_period = {}
+                  for c in group:
+                      p = c.get('period') or '-'
+                      if p not in by_period or rank_value(c) > rank_value(by_period[p]):
+                          by_period[p] = c
+                  values = [rank_value(c) for c in by_period.values() if rank_value(c) is not None]
+                  if not values:
+                      continue
+                  recent = rank_value(by_period['recent_6m']) if 'recent_6m' in by_period else 0.0
+                  positive = sum(1 for v in values if v > 0)
+                  score = min(values) + sum(values) / len(values) * 0.35 + recent * 0.2 + positive * 4.0
+                  out.append({'cell': robust_representative(group), 'score': score, 'values': values, 'positive': positive})
+              return sorted(out, key=lambda x: x['score'], reverse=True)
+
           def card_payload(title, template, card_elements):
               return {
                   'msg_type': 'interactive',
@@ -778,7 +805,8 @@ jobs:
                   elements.append({'tag': 'hr'})
                   elements.append({'tag': 'div', 'text': {'tag': 'lark_md', 'content': '⚠️ 结果文件存在，但未解析到有效现金收益或夏普指标'}})
               else:
-                  best = max(valid, key=rank_value)
+                  robust_ranked = robust_scores(valid) if len(periods) > 1 else []
+                  best = robust_ranked[0]['cell'] if robust_ranked else max(valid, key=rank_value)
                   ranked = sorted(valid, key=rank_value, reverse=True)
                   pos_cnt = sum(1 for c in valid if (rank_value(c) or 0) > 0)
                   neg_cnt = sum(1 for c in valid if (rank_value(c) or 0) <= 0)
@@ -789,8 +817,9 @@ jobs:
                   best_period = f'（{period_label(best.get("period", ""))}）' if len(periods) > 1 else ''
                   tp_str = f'TP{best["tp"]}%' if best['tp'] else '无止盈'
                   tr_str = f'移动止盈-{best["tr"]}%' if best['tr'] else '无移动止盈'
+                  best_label = '稳健参数（跨周期惩罚）' if robust_ranked else '最优参数（按现金收益）'
                   elements.append({'tag': 'div', 'text': {'tag': 'lark_md',
-                      'content': f'{tag} **最优参数（按现金收益）{best_period}**: {style_label(best.get("style", ""), best.get("style_label", ""))} / 持有{best["hold"]}天 / SL-{best["sl"]}% / {tp_str} / {tr_str}'}})
+                      'content': f'{tag} **{best_label}{best_period}**: {style_label(best.get("style", ""), best.get("style_label", ""))} / 持有{best["hold"]}天 / SL-{best["sl"]}% / {tp_str} / {tr_str}'}})
 
                   cols = [
                       ('**现金收益**', f'{fmt(best.get("cash_return"), "+.2f")}%'),
@@ -811,6 +840,10 @@ jobs:
                       'content': f'**策略体检**: {risk_comment(best)}  ·  正现金收益组合 {pos_cnt} / 非正现金收益组合 {neg_cnt}'}})
                   elements.append({'tag': 'div', 'text': {'tag': 'lark_md',
                       'content': f'**逐笔辅助指标**: 夏普 {sharp_flag(best.get("sharpe"))} {fmt(best.get("sharpe"), ".3f")}，胜率 {fmt(best.get("win"), ".1f")}%，均收 {fmt(best.get("avg"), "+.2f")}%'}})
+                  if robust_ranked:
+                      rb = robust_ranked[0]
+                      elements.append({'tag': 'div', 'text': {'tag': 'lark_md',
+                          'content': f'**跨周期稳健性**: 正收益周期 {rb["positive"]}/{len(rb["values"])}，最差周期 {fmt(min(rb["values"]), "+.2f")}%，稳健分 {fmt(rb["score"], ".2f")}'}})
 
                   if len(periods) > 1:
                       elements.append({'tag': 'hr'})

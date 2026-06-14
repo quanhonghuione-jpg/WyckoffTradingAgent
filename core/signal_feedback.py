@@ -138,6 +138,29 @@ def _trigger_tags_by_code(triggers: dict[str, list[tuple[str, float]]]) -> dict[
     return {code: sorted(values) for code, values in tags.items()}
 
 
+def _observation_feature_inputs(
+    signal_type: str,
+    code: str,
+    trigger_score: float,
+    ctx: dict[str, Any],
+) -> tuple[float, dict[str, Any]]:
+    springboard = _springboard_observation_fields(signal_type, code, ctx["springboard_map"])
+    footprint = _footprint_fields(signal_type, code, ctx["footprint_map"])
+    intraday_tail = _intraday_tail_fields(signal_type, code, ctx["intraday_tail_map"])
+    source_context = _source_context_fields(signal_type, code, ctx["source_context_map"])
+    priority_score = _float(ctx["score_map"].get(code))
+    features = _features_json(
+        signal_type,
+        trigger_score,
+        priority_score,
+        footprint,
+        springboard,
+        intraday_tail,
+        source_context,
+    )
+    return priority_score, {"features_json": features, **springboard}
+
+
 def _signal_observation_row(
     trade_date: str,
     market: str,
@@ -149,11 +172,7 @@ def _signal_observation_row(
     signal_type, code, trigger_score = item
     stage = ctx["stage_map"].get(code, "")
     channel = ctx["channel_map"].get(code, "")
-    springboard = _springboard_observation_fields(signal_type, code, ctx["springboard_map"])
-    footprint = _footprint_fields(signal_type, code, ctx["footprint_map"])
-    intraday_tail = _intraday_tail_fields(signal_type, code, ctx["intraday_tail_map"])
-    source_context = _source_context_fields(signal_type, code, ctx["source_context_map"])
-    priority_score = _float(ctx["score_map"].get(code))
+    priority_score, feature_fields = _observation_feature_inputs(signal_type, code, trigger_score, ctx)
     return {
         "market": market,
         "trade_date": trade_date,
@@ -177,18 +196,9 @@ def _signal_observation_row(
         "selected_for_ai": code in ctx["selected"],
         "ai_recommended": code in ctx["recommended"],
         "source": ctx["source_map"].get(code, "funnel"),
-        "features_json": _features_json(
-            signal_type,
-            trigger_score,
-            priority_score,
-            footprint,
-            springboard,
-            intraday_tail,
-            source_context,
-        ),
         "lifecycle_status": "ACTIVE",
         "updated_at": now_iso,
-        **springboard,
+        **feature_fields,
     }
 
 

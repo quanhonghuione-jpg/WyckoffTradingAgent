@@ -390,6 +390,33 @@ def fit_ai_candidate_quotas(
     return (trend_eff, accum_eff)
 
 
+def _env_non_negative_int(name: str, default: str) -> int:
+    import os
+
+    return max(int(os.getenv(name, default)), 0)
+
+
+def _ai_candidate_quota_defaults() -> dict[str, tuple[int, int]]:
+    return {
+        "RISK_ON": (
+            _env_non_negative_int("FUNNEL_AI_RISK_ON_TREND", "3"),
+            _env_non_negative_int("FUNNEL_AI_RISK_ON_ACCUM", "5"),
+        ),
+        "BEAR_REBOUND": (
+            _env_non_negative_int("FUNNEL_AI_BEAR_REBOUND_TREND", "1"),
+            _env_non_negative_int("FUNNEL_AI_BEAR_REBOUND_ACCUM", "2"),
+        ),
+        "RISK_OFF": (
+            _env_non_negative_int("FUNNEL_AI_RISK_OFF_TREND", "0"),
+            _env_non_negative_int("FUNNEL_AI_RISK_OFF_ACCUM", "0"),
+        ),
+        "NEUTRAL": (
+            _env_non_negative_int("FUNNEL_AI_NEUTRAL_TREND", "2"),
+            _env_non_negative_int("FUNNEL_AI_NEUTRAL_ACCUM", "3"),
+        ),
+    }
+
+
 def resolve_ai_candidate_policy(
     regime: str,
     override_total_cap: int = -1,
@@ -400,44 +427,21 @@ def resolve_ai_candidate_policy(
     CRASH / PANIC_REPAIR / BEAR_REBOUND / BLACK_SWAN all share the defensive quota family
     instead of silently falling back to NEUTRAL.
     """
-    import os
-
     total_cap = (
-        max(int(os.getenv("FUNNEL_AI_TOTAL_CAP", "12")), 0)
-        if override_total_cap < 0
-        else max(int(override_total_cap), 0)
+        _env_non_negative_int("FUNNEL_AI_TOTAL_CAP", "8") if override_total_cap < 0 else max(int(override_total_cap), 0)
     )
-    # 配额重平衡：原版严重偏向 Accum 左侧（4/8, 3/7, 1/5），导致大量底部横盘股拉低胜率。
-    # 现改为 Trend 优先：右侧已确认趋势的股票胜率远高于左侧潜伏。
-    risk_on_trend = max(int(os.getenv("FUNNEL_AI_RISK_ON_TREND", "7")), 0)
-    risk_on_accum = max(int(os.getenv("FUNNEL_AI_RISK_ON_ACCUM", "5")), 0)
-    bear_rebound_trend = max(int(os.getenv("FUNNEL_AI_BEAR_REBOUND_TREND", "1")), 0)
-    bear_rebound_accum = max(int(os.getenv("FUNNEL_AI_BEAR_REBOUND_ACCUM", "2")), 0)
-    risk_off_trend = max(int(os.getenv("FUNNEL_AI_RISK_OFF_TREND", "2")), 0)
-    risk_off_accum = max(int(os.getenv("FUNNEL_AI_RISK_OFF_ACCUM", "3")), 0)
-    neutral_trend = max(int(os.getenv("FUNNEL_AI_NEUTRAL_TREND", "5")), 0)
-    neutral_accum = max(int(os.getenv("FUNNEL_AI_NEUTRAL_ACCUM", "5")), 0)
-    max_trend_l3_fill = max(int(os.getenv("FUNNEL_AI_MAX_TREND_L3_FILL", "0")), 0)
-    max_accum_l3_fill = max(int(os.getenv("FUNNEL_AI_MAX_ACCUM_L3_FILL", "0")), 0)
 
     regime_norm = str(regime or "").strip().upper()
     if regime_norm == "RISK_ON":
-        requested_trend = risk_on_trend
-        requested_accum = risk_on_accum
         quota_family = "RISK_ON"
     elif regime_norm in {"BEAR_REBOUND", "PANIC_REPAIR"}:
-        requested_trend = bear_rebound_trend
-        requested_accum = bear_rebound_accum
         quota_family = "BEAR_REBOUND"
     elif regime_norm in {"RISK_OFF", "CRASH", "BLACK_SWAN"}:
-        requested_trend = risk_off_trend
-        requested_accum = risk_off_accum
         quota_family = "RISK_OFF"
     else:
-        requested_trend = neutral_trend
-        requested_accum = neutral_accum
         quota_family = "NEUTRAL"
 
+    requested_trend, requested_accum = _ai_candidate_quota_defaults()[quota_family]
     trend_quota, accum_quota = fit_ai_candidate_quotas(
         total_cap,
         requested_trend,
@@ -451,8 +455,8 @@ def resolve_ai_candidate_policy(
         "requested_accum_quota": requested_accum,
         "trend_quota": trend_quota,
         "accum_quota": accum_quota,
-        "max_trend_l3_fill": max_trend_l3_fill,
-        "max_accum_l3_fill": max_accum_l3_fill,
+        "max_trend_l3_fill": _env_non_negative_int("FUNNEL_AI_MAX_TREND_L3_FILL", "0"),
+        "max_accum_l3_fill": _env_non_negative_int("FUNNEL_AI_MAX_ACCUM_L3_FILL", "0"),
     }
 
 
@@ -1466,13 +1470,7 @@ def _detect_sos(df: pd.DataFrame, cfg: FunnelConfig) -> float | None:
     return vol_ratio
 
 
-def _detect_compression(df: pd.DataFrame, cfg: FunnelConfig) -> float | None:
-    """压缩蓄势：连续N日ATR收窄+缩量，爆发前夜形态。返回压缩比或None。"""
-    lookback = cfg.compression_lookback
-    atr_w = cfg.compression_atr_window
-    min_required = atr_w + lookback + 5
-    if len(df) < min_required:
-        return None
+def _compression_ohlcv(df: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series] | None:
     df_s = _sorted_if_needed(df)
     close = pd.to_numeric(df_s["close"], errors="coerce")
     high = pd.to_numeric(df_s["high"], errors="coerce")
@@ -1480,32 +1478,46 @@ def _detect_compression(df: pd.DataFrame, cfg: FunnelConfig) -> float | None:
     volume = pd.to_numeric(df_s["volume"], errors="coerce")
     if close.isna().all() or high.isna().all() or low.isna().all():
         return None
+    return close, high, low, volume
 
-    if cfg.compression_require_direction:
-        direction_ok = False
-        if len(close) >= 25:
-            ma20 = close.rolling(20).mean()
-            ma20_last = ma20.iloc[-1]
-            ma20_prev = ma20.shift(5).iloc[-1]
-            if pd.notna(ma20_last) and pd.notna(ma20_prev) and float(ma20_last) >= float(ma20_prev):
-                direction_ok = True
-        if len(close) >= 50:
-            ma50 = close.rolling(50).mean()
-            ma50_last = ma50.iloc[-1]
-            close_last = close.iloc[-1]
-            if pd.notna(ma50_last) and pd.notna(close_last) and float(close_last) >= float(ma50_last):
-                direction_ok = True
-        if not direction_ok:
-            return None
 
+def _compression_direction_ok(close: pd.Series, cfg: FunnelConfig) -> bool:
+    if not cfg.compression_require_direction:
+        return True
+    direction_ok = False
+    if len(close) >= 25:
+        ma20 = close.rolling(20).mean()
+        ma20_last = ma20.iloc[-1]
+        ma20_prev = ma20.shift(5).iloc[-1]
+        direction_ok = pd.notna(ma20_last) and pd.notna(ma20_prev) and float(ma20_last) >= float(ma20_prev)
+    if len(close) >= 50:
+        ma50_last = close.rolling(50).mean().iloc[-1]
+        close_last = close.iloc[-1]
+        ma50_ok = pd.notna(ma50_last) and pd.notna(close_last) and float(close_last) >= float(ma50_last)
+        direction_ok = direction_ok or ma50_ok
+    return direction_ok
+
+
+def _compression_bias_ok(close: pd.Series, cfg: FunnelConfig) -> bool:
     if len(close) >= 200:
         ma200 = close.rolling(200).mean()
         ma200_last = ma200.iloc[-1]
         if pd.notna(ma200_last) and float(ma200_last) > 0:
             bias = (float(close.iloc[-1]) - float(ma200_last)) / float(ma200_last) * 100.0
             if bias > cfg.global_entry_max_bias_200:
-                return None
+                return False
+    return True
 
+
+def _compression_atr_ratio(
+    close: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    volume: pd.Series,
+    cfg: FunnelConfig,
+) -> float | None:
+    lookback = cfg.compression_lookback
+    atr_w = cfg.compression_atr_window
     tr = pd.concat(
         [high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()],
         axis=1,
@@ -1533,6 +1545,21 @@ def _detect_compression(df: pd.DataFrame, cfg: FunnelConfig) -> float | None:
 
     hist_atr_median = float(hist_atr.median())
     return float(current_atr_avg / hist_atr_median) if hist_atr_median > 0 else None
+
+
+def _detect_compression(df: pd.DataFrame, cfg: FunnelConfig) -> float | None:
+    """压缩蓄势：连续N日ATR收窄+缩量，爆发前夜形态。返回压缩比或None。"""
+    lookback = cfg.compression_lookback
+    atr_w = cfg.compression_atr_window
+    if len(df) < atr_w + lookback + 5:
+        return None
+    ohlcv = _compression_ohlcv(df)
+    if ohlcv is None:
+        return None
+    close, high, low, volume = ohlcv
+    if not _compression_direction_ok(close, cfg) or not _compression_bias_ok(close, cfg):
+        return None
+    return _compression_atr_ratio(close, high, low, volume, cfg)
 
 
 def _trend_pullback_peak_idx(close: pd.Series, cfg: FunnelConfig) -> int | None:
