@@ -789,6 +789,17 @@ def _is_confirmed_step4_candidate(item: dict) -> bool:
     return "confirmed" in text or "确认" in text
 
 
+def _filter_confirmed_step3_codes(codes: list[str], symbols_info: list[dict]) -> tuple[list[str], list[str]]:
+    allowed = {
+        str(item.get("code", "")).strip()
+        for item in symbols_info
+        if isinstance(item, dict) and _is_confirmed_step4_candidate(item)
+    }
+    kept = [code for code in codes if str(code).strip() in allowed]
+    blocked = [code for code in codes if str(code).strip() not in allowed]
+    return kept, blocked
+
+
 def _run_step4_holdings_diagnosis(portfolio_id: str, logs_path: str | None) -> str:
     tickflow_api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
     if not tickflow_api_key:
@@ -1129,6 +1140,15 @@ def main() -> int:
                     report=step3_report_text,
                     allowed_codes=allowed_codes,
                 )
+                step3_springboard_codes, blocked_unconfirmed = _filter_confirmed_step3_codes(
+                    step3_springboard_codes, symbols_info
+                )
+                if blocked_unconfirmed:
+                    _log(
+                        "Step3 批量研报: 未二次确认起跳板已拦截 "
+                        f"{len(blocked_unconfirmed)}只 ({', '.join(blocked_unconfirmed[:8])})",
+                        logs_path,
+                    )
             except Exception as e:
                 step3_springboard_codes = []
                 _log(f"Step3 批量研报: 起跳板解析失败，已降级为空。err={e}", logs_path)

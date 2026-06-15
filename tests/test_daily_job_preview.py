@@ -116,6 +116,22 @@ def test_step4_candidate_confirmation_gate_accepts_only_confirmed():
     assert not daily_job._is_confirmed_step4_candidate({"tag": "SOS（量价点火）"})
 
 
+def test_step3_codes_filter_keeps_only_confirmed_candidates():
+    import scripts.daily_job as daily_job
+
+    kept, blocked = daily_job._filter_confirmed_step3_codes(
+        ["000001", "000002", "000003"],
+        [
+            {"code": "000001", "signal_status": "confirmed"},
+            {"code": "000002", "tag": "SOS（量价点火）"},
+            {"code": "000003", "tag": "LPS(确认)"},
+        ],
+    )
+
+    assert kept == ["000001", "000003"]
+    assert blocked == ["000002"]
+
+
 def test_signal_confirmation_dry_run_does_not_write(monkeypatch):
     import integrations.supabase_signal_pending as signal_pending
 

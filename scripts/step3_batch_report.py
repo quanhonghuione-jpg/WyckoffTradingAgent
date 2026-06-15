@@ -104,6 +104,12 @@ STEP3_SEND_COMPLIANCE_BRIEF = os.getenv("STEP3_SEND_COMPLIANCE_BRIEF", "1").stri
     "yes",
     "on",
 }
+STEP3_REQUIRE_CONFIRMED_OPERATION = os.getenv("STEP3_REQUIRE_CONFIRMED_OPERATION", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 RECENT_DAYS = 15
@@ -570,6 +576,27 @@ def _build_signal_confirmed_preview(selected_df: pd.DataFrame) -> str:
         confirm_date = _clean_text(row.get("confirm_date")) or "-"
         reason = _clean_text(row.get("confirm_reason")) or "确认条件已满足"
         lines.append(f"- {code} {name} | {signal_type} | {signal_date} → {confirm_date} | {reason}")
+    return "\n".join(lines) + "\n\n---\n"
+
+
+def _filter_confirmed_ops_codes(ops_codes: list[str], selected_df: pd.DataFrame) -> tuple[list[str], list[str]]:
+    if not STEP3_REQUIRE_CONFIRMED_OPERATION or selected_df is None or selected_df.empty:
+        return ops_codes, []
+    status_map = {
+        str(row.get("code", "")).strip(): str(row.get("signal_status", "")).strip().lower()
+        for _, row in selected_df.iterrows()
+    }
+    kept = [code for code in ops_codes if status_map.get(str(code).strip()) == "confirmed"]
+    blocked = [code for code in ops_codes if code not in kept]
+    return kept, blocked
+
+
+def _build_unconfirmed_ops_block(blocked_codes: list[str], code_name: dict[str, str]) -> str:
+    if not blocked_codes:
+        return ""
+    lines = ["## 🚧 未二次确认拦截（前置）"]
+    for code in blocked_codes:
+        lines.append(f"- {code} {code_name.get(code, code)}：模型曾列入起跳板，但未满足二次确认，降级为观察")
     return "\n".join(lines) + "\n\n---\n"
 
 
@@ -1237,6 +1264,10 @@ def run(
             exit_reason=_exit_reason,
             financial_metrics=financial_map.get(code),
             springboard_grade=str(row.get("springboard_grade", "")).strip() or None,
+            candidate_source=source_label,
+            signal_status=str(row.get("signal_status", "")).strip() or None,
+            confirm_date=str(row.get("confirm_date", "")).strip() or None,
+            confirm_reason=str(row.get("confirm_reason", "")).strip() or None,
         )
         payloads_by_track.setdefault(track_key, []).append(payload)
         df_by_track[track_key] = pd.concat(
@@ -1391,11 +1422,13 @@ def run(
             code = str(item.get("code", "")).strip()
             if code and code not in ops_codes:
                 ops_codes.append(code)
+    ops_codes, blocked_unconfirmed_ops = _filter_confirmed_ops_codes(ops_codes, selected_df)
     ops_lines = [f"- {c} {code_name.get(c, c)}" for c in ops_codes]
     ops_preview = "## 🏹 处于起跳板速览（前置）\n" + ("\n".join(ops_lines) if ops_lines else "- 无") + "\n\n---\n"
     signal_confirmed_preview = _build_signal_confirmed_preview(selected_df)
+    unconfirmed_ops_block = _build_unconfirmed_ops_block(blocked_unconfirmed_ops, code_name)
 
-    content = f"{rag_veto_preview}{signal_confirmed_preview}{ops_preview}{SPRINGBOARD_ABC_LEGEND}\n{report}"
+    content = f"{rag_veto_preview}{signal_confirmed_preview}{ops_preview}{unconfirmed_ops_block}{SPRINGBOARD_ABC_LEGEND}\n{report}"
     if rag_veto_lines:
         content += "\n\n## 🛑 RAG 防雷剔除清单\n" + "\n".join(rag_veto_lines)
     print(f"[step3] 飞书发送原文长度={len(content)}（不压缩，交由飞书分片）")
